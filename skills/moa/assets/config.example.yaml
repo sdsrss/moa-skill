@@ -57,8 +57,9 @@ members:
     channel: api
     protocol: openrouter
     model: x-ai/grok-4.5       # 多数 key 为 list-only 404;仅有 x-ai 供给的 key 可调
-    fallback:                  # 无 x-ai 供给时降级到可服务模型(牺牲第四家族多样性,好过整席丢失)
-      - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}   # ✔ 2026-07-12 实测 http200
+    fallback:                  # 无 x-ai 供给时依次降级(牺牲第四家族多样性,好过整席丢失)
+      - {channel: api, protocol: openrouter, model: anthropic/claude-opus-4.8}   # ✔ 2026-07-12 实测 http200
+      - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}          # ✔ 2026-07-12 实测 http200
 
 # 仲裁人 = 当前 agent(带完整上下文),不在此配置,不走外部调用。
 
