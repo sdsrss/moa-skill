@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.2.1-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-125%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.3.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-125%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -39,17 +39,22 @@ It is a **committee you summon on demand — not an auto-development pipeline.**
 
 ## Installation
 
-MoA Skill installs as a **Claude Code skill** by copying it into `~/.claude/skills/`, which Claude Code auto-discovers. A `.claude-plugin/plugin.json` manifest is included for future marketplace distribution, but **no marketplace is wired yet**, so use the direct-copy method below.
+Two ways to install. **Marketplace** (added in v1.3.0) is the one-liner; **direct-copy** is the dependency-free fallback.
 
 ```bash
-# 1. Get the repo and copy the skill into place (direct-copy install)
+# Option A — Claude Code marketplace (recommended)
+/plugin marketplace add sdsrss/moa-skill
+/plugin install moa@moa-skill
+
+# Option B — direct-copy (no marketplace; copy the skill into place)
 git clone https://github.com/sdsrss/moa-skill.git
 cp -r moa-skill/skills/moa ~/.claude/skills/moa      # Claude Code auto-discovers ~/.claude/skills/
+```
 
-# 2. Runtime dependency (the HTTP layer is pure stdlib)
+```bash
+# Runtime dependency either way (the HTTP layer is pure stdlib)
 pip install pyyaml
-
-# 3. Optional CH2 (local CLI channel): install the codex CLI (0.144+) and log in
+# Optional CH2 (local CLI channel): install the codex CLI (0.144+) and log in
 ```
 
 **Configure API keys via environment variables only** — never written to disk, logs, or reports:

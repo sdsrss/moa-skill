@@ -7,7 +7,7 @@
 原理基于 **Mixture-of-Agents（MoA）**：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术 / 事实检索）不要用。
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.2.1-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-125%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.3.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-125%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -39,17 +39,22 @@
 
 ## 安装
 
-MoA Skill 以 **Claude Code 技能**形态安装：拷贝到 `~/.claude/skills/`，Claude Code 自动发现。仓库含 `.claude-plugin/plugin.json` 清单以备将来走 marketplace 分发，但**目前尚未接入 marketplace**，请用下面的直接拷贝法。
+两种安装方式。**Marketplace**（v1.3.0 起支持）是一行命令；**直接拷贝**是零依赖兜底。
 
 ```bash
-# 1. 取仓库并把 skill 拷到位（直接拷贝安装）
+# 方式 A —— Claude Code marketplace（推荐）
+/plugin marketplace add sdsrss/moa-skill
+/plugin install moa@moa-skill
+
+# 方式 B —— 直接拷贝（不走 marketplace，把 skill 拷到位）
 git clone https://github.com/sdsrss/moa-skill.git
 cp -r moa-skill/skills/moa ~/.claude/skills/moa      # Claude Code 自动发现 ~/.claude/skills/
+```
 
-# 2. 运行依赖（HTTP 层为纯标准库）
+```bash
+# 两种方式都需要的运行依赖（HTTP 层为纯标准库）
 pip install pyyaml
-
-# 3. 可选 CH2（本地 CLI 通道）：装 codex CLI（0.144+）并完成 codex 侧登录
+# 可选 CH2（本地 CLI 通道）：装 codex CLI（0.144+）并完成 codex 侧登录
 ```
 
 **API key 一律走环境变量**——不落盘、不进日志 / 报告：

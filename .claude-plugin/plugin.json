@@ -1,11 +1,12 @@
 {
   "name": "moa",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Multi-model committee (Mixture-of-Agents) for Claude Code: your agent chairs up to 4 heterogeneous LLM members that blind-review, decide, and brainstorm in parallel — independent generation → structured interaction → evidence-driven convergence — for conclusions more reliable than any single model.",
   "author": {
     "name": "sds.rs",
     "email": "jack.sds5889@gmail.com"
   },
+  "repository": "https://github.com/sdsrss/moa-skill",
   "license": "MIT",
   "keywords": [
     "mixture-of-agents",
