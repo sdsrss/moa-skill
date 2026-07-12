@@ -7,7 +7,7 @@ description: MoA 多模型委员会——把当前 agent(仲裁人)与最多4个
 
 把多个异构大模型组成"委员会":委员互相隔离、各领角色独立盲审,当前 agent 作为仲裁人按硬规则收敛。原理基于 Mixture-of-Agents——不同模型盲点不同,独立盲审 + 结构化聚合能突破单模型上限。角色契约、收敛硬规则与简报模板见本目录 `references/`。
 
-> **实现状态:M4 基本完成(v1.0)**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、主席综合/仲裁/策展、auto 路由、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集、`.claude-plugin/plugin.json` 分发清单。
+> **实现状态:M4 基本完成(v1.0)**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、主席综合/仲裁/策展、auto 路由、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。三通道(CH1 子代理 / CH2 codex / CH3 API)、Self-MoA、评审/决策/头脑风暴均经真实端到端验证。
 
 ## 三种调用模式
 

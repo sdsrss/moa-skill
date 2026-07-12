@@ -156,6 +156,20 @@ def test_has_dispatchable_channel():
         {"channel": "subagent", "fallback": [{"channel": "api"}]})
 
 
+def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
+    """codex(cli)席可省 model(用 codex 默认);结果构造须给 model_used=None,不得 KeyError。
+    回归:_dispatch_channels 曾用 ccfg['model'] 硬取键,codex 成功后崩在结果构造上。"""
+    monkeypatch.setattr(moa, "call_cli_codex",
+                        lambda ccfg, system, user, timeout: ('{"verdict":"pass"}', {"verdict": "pass"}))
+    member = {"name": "skeptic-a", "seat": "A", "channel": "cli", "protocol": "codex"}  # 无 model
+    opts = {"timeout_seconds": 60, "max_tokens_member": 100}
+    res = moa._dispatch_channels(member, "feasibility_skeptic", "sys", "usr", opts)
+    assert res["parsed"] == {"verdict": "pass"}
+    assert res["model_used"] is None          # 省 model → None,非崩溃
+    assert res["channel_used"] == "cli"
+    assert res["err_class"] is None
+
+
 # ---------- 统计块: 按模式分支 + 分母只计成功 + degraded ----------
 
 def _res(name, seat, parsed, err_class=None):

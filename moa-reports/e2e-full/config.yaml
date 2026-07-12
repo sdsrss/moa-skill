@@ -1,0 +1,34 @@
+# 顶配整跑 E2E: 4 席 review, 三通道齐活(CH2 codex + CH3 api + CH1 subagent)。
+# 模型档为省 token 用便宜档;通道覆盖才是本轮验收目标(§12.3)。key 走环境变量。
+members:
+  - name: skeptic-a
+    seat: A                       # feasibility_skeptic
+    channel: cli                  # CH2: codex(GPT 系,订阅通道优先)
+    protocol: codex
+    # model 省略 = 用 codex 默认模型
+    timeout_seconds: 150
+  - name: maintainer-b
+    seat: B                       # maintainability_reviewer
+    channel: api                  # CH3: openrouter
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+  - name: security-c
+    seat: C                       # security_auditor
+    channel: subagent             # CH1: 仲裁人用 Agent 工具外派发(Claude 系)
+    model: claude-haiku-4-5
+  - name: user-d
+    seat: D                       # user_advocate
+    channel: api                  # CH3: openrouter
+    protocol: openrouter
+    model: openai/gpt-4.1-nano
+    timeout_seconds: 120
+
+options:
+  max_tokens_member: 1500
+  timeout_seconds: 150
+  min_successful_members: 2
+  grace_seconds: 25
+  max_refine_rounds: 1
+
+custom_roles: {}

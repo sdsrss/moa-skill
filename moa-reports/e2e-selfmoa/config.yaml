@@ -1,0 +1,12 @@
+# Self-MoA(主动) E2E: 单一模型复制成 3 席,座位 A/B/C 自动分化评审角色。
+# 委员会经 `--members 3 --models "openai/gpt-4.1-nano"` 命令行覆盖(见下方运行命令),
+# 本文件只提供 options;members 会被 apply_custom_committee 整体替换。
+# 声明:Self-MoA 只有【角色分化】收益,无【跨模型错误去相关】收益(同模型共享盲区)。
+members: []          # 占位;--models 会覆盖
+
+options:
+  max_tokens_member: 1500
+  timeout_seconds: 120
+  min_successful_members: 2
+  grace_seconds: 20
+  max_refine_rounds: 0

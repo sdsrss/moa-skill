@@ -380,7 +380,8 @@ def _dispatch_channels(member, role_key, system, user, opts):
                     opts["max_tokens_member"], timeout, None)
             return {
                 "name": member["name"], "seat": seat, "role": role_key,
-                "model_used": ccfg["model"], "protocol": ccfg.get("protocol", "-" if kind == "cli" else "openrouter"),
+                "model_used": ccfg.get("model"),  # codex 席可省 model(用 codex 默认)→ None,非 KeyError
+                "protocol": ccfg.get("protocol", "-" if kind == "cli" else "openrouter"),
                 "channel_used": kind + (f" ({note})" if note else ""),
                 "raw": raw, "parsed": parsed, "usage": usage, "latency_s": round(time.time() - t0, 1),
                 "error": None if parsed else "output not parseable", "err_class": None,
