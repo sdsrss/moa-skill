@@ -156,6 +156,24 @@ def test_has_dispatchable_channel():
         {"channel": "subagent", "fallback": [{"channel": "api"}]})
 
 
+def test_effective_billing_matches_actual_run():
+    """dry-run 计费判定须与 moa.py 真正会跑的通道一致(回归 dry-run 少报 bug):
+    旧逻辑只看主通道,把'subagent + api fallback'误记为免费订阅,而 generate 实际走计费 API。"""
+    # 纯 subagent(无 api/cli fallback)= 仲裁人免费派发
+    assert moa._effective_billing({"channel": "subagent", "model": "claude"}) == "sub"
+    # subagent + api fallback = 脚本实跑计费 API(旧逻辑误记为免费,回归点)
+    assert moa._effective_billing(
+        {"channel": "subagent", "model": "claude",
+         "fallback": [{"channel": "api", "model": "anthropic/claude"}]}) == "billed"
+    # subagent + cli fallback = 订阅(codex 也免费)
+    assert moa._effective_billing(
+        {"channel": "subagent", "model": "c",
+         "fallback": [{"channel": "cli", "model": "gpt"}]}) == "sub"
+    # cli(codex)= 订阅免费;api = 计费
+    assert moa._effective_billing({"channel": "cli", "model": "gpt"}) == "sub"
+    assert moa._effective_billing({"channel": "api", "model": "m"}) == "billed"
+
+
 def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     """codex(cli)席可省 model(用 codex 默认);结果构造须给 model_used=None,不得 KeyError。
     回归:_dispatch_channels 曾用 ccfg['model'] 硬取键,codex 成功后崩在结果构造上。"""

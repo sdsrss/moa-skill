@@ -382,6 +382,17 @@ def resolve_channel(member: dict):
     return tries
 
 
+def _effective_billing(member) -> str:
+    """dry-run 计费判定:返回 'billed'(CH3 计费) 或 'sub'(订阅/免费,CH1 子代理或 CH2 codex)。
+    按 moa.py *真正会跑* 的通道判定,而非配置的主通道——纯 subagent(无 api/cli fallback)由仲裁人
+    免费派发;否则脚本跑 resolve_channel 的首个 try(cli=订阅免费, api=计费)。修正旧逻辑只看主通道、
+    把 'subagent + api fallback' 误记为免费的少报 bug(该席位 generate 时实走计费 API)。"""
+    tries = resolve_channel(member)
+    if not tries:
+        return "sub"                        # 纯 subagent → 仲裁人免费派发
+    return "sub" if tries[0][0] == "cli" else "billed"
+
+
 def _seat_role(member, mode):
     seat = member.get("seat", "?")
     return member.get("role") or DEFAULT_SEAT_ROLE.get((mode, seat)) or seat
@@ -969,8 +980,11 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
     api_calls_sub = api_calls_billed = 0
     for m in members:
         ch = m.get("channel", "api")
-        print(f"{m['name']:<18}{m.get('seat','?'):<6}{ch:<10}{m.get('model',''):<28}{m.get('protocol','-')}")
-        if ch in ("subagent", "cli"):
+        bill = _effective_billing(m)
+        # 配置写 subagent 但因 api fallback 实走计费时,显式警示——否则成本被低估
+        flag = "  ⚠ 实走 api fallback=计费" if ch == "subagent" and bill == "billed" else ""
+        print(f"{m['name']:<18}{m.get('seat','?'):<6}{ch:<10}{m.get('model',''):<28}{m.get('protocol','-')}{flag}")
+        if bill == "sub":
             api_calls_sub += 1
         else:
             api_calls_billed += 1

@@ -1,6 +1,6 @@
 {
   "name": "moa",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Multi-model committee (Mixture-of-Agents) for Claude Code: your agent chairs up to 4 heterogeneous LLM members that blind-review, decide, and brainstorm in parallel — independent generation → structured interaction → evidence-driven convergence — for conclusions more reliable than any single model.",
   "author": {
     "name": "sds.rs",

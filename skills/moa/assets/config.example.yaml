@@ -40,10 +40,10 @@ members:
 
   - name: coding-b             # B 席: 代码理解/工程实现
     seat: B
-    channel: subagent          # Claude 子代理走订阅(仲裁人脚本外派发)
-    model: claude-opus-4-8
-    fallback:
-      - {channel: api, protocol: openrouter, model: anthropic/claude-opus-4.8}
+    channel: subagent          # Claude 子代理走订阅、不计费(仲裁人脚本外派发)。
+    model: claude-opus-4-8     # 纯 subagent、不挂 api fallback:挂了 moa.py 会判为可派发、
+                               # 直接走计费 API(仲裁人也不再免费派发它),等于白丢订阅优势。
+                               # 需 API 兜底时另配一个 api 席,别把 fallback 挂在订阅席上。
 
   - name: fact-c               # C 席: 事实核查(尽量开搜索接地)
     seat: C
@@ -52,14 +52,16 @@ members:
     model: google/gemini-3.1-pro-preview
     timeout_seconds: 240       # Gemini 系较慢,单独放宽
 
-  - name: adversarial-d        # D 席: 用户体验/反方红队(xAI 第四族,最大化错误去相关)
+  - name: adversarial-d        # D 席: 用户体验/反方红队
     seat: D
-    channel: api
-    protocol: openrouter
-    model: x-ai/grok-4.5       # 多数 key 为 list-only 404;仅有 x-ai 供给的 key 可调
-    fallback:                  # 无 x-ai 供给时依次降级(牺牲第四家族多样性,好过整席丢失)
-      - {channel: api, protocol: openrouter, model: anthropic/claude-opus-4.8}   # ✔ 2026-07-12 实测 http200
-      - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}          # ✔ 2026-07-12 实测 http200
+    channel: subagent          # CH1: 再派一个 Claude Opus 4.8 子代理扮演反方角色(默认 role=user_advocate)。
+    model: claude-opus-4-8     # 与 B 同模型、不同角色 = 主动 Self-MoA:角色分化即出多样性(§9.2),
+                               # 且走订阅不计费、省 token。纯 subagent(无 api fallback)→ moa.py 跳过,
+                               # 由仲裁人 Task 外派发(加了 api fallback 反而会让脚本走计费 API,失去省 token 意义)。
+    # ↑ 想要 xAI 第四族真·跨模型去相关(需该 key 有 x-ai 供给)时,把上面 channel/model 两行换成:
+    #     channel: api
+    #     protocol: openrouter
+    #     model: x-ai/grok-4.5      # 多数 key 为 list-only 404,先按上文备忘实调核对
 
 # 仲裁人 = 当前 agent(带完整上下文),不在此配置,不走外部调用。
 
