@@ -15,26 +15,28 @@
 #   排障提示: 过代理后仍 HTTP 404 = 该 key 真不服务此模型(list-only),不是代理问题(gpt-5 同代理可通即为证)。
 # 默认为 2026-07 各家顶级模型(异构四家族 A/B/C/D)。模型 ID 迭代快,正式运行前对照核对一次。
 #
-# ── slug 核对备忘(2026-07-12 对某 OPENROUTER key 实测,不同 key 供给不同,自行复核)──
+# ── slug 核对备忘(2026-07-12 二次实测,对某 OPENROUTER key;不同 key 供给不同,自行复核)──
 # 查全量可用 slug:  curl -s https://openrouter.ai/api/v1/models -H "Authorization: Bearer $OPENROUTER_API_KEY" | jq -r '.data[].id'
-#   ★ 推理模型陷阱: gpt-5 / gpt-5-pro / gemini-3.1-pro-preview 在 max_tokens 很小(如 5~30)时
-#     推理会吃光额度、content 返空壳 —— 这是【假阴性】,不是模型不可用。核对/正式跑都要给足
-#     max_tokens(≥800;options.max_tokens_member=3000 足够)。别再拿"返空"当"不存在"。
-#   ✔ 实测可服务: openai/gpt-5, openai/gpt-5-codex, google/gemini-3.1-pro-preview,
-#     google/gemini-2.5-pro, anthropic/claude-opus-4.8
-#   ✘ 在清单里但端点 404(list-only,不可用): x-ai/grok-4.x 全系, deepseek/deepseek-v3.2
-#   ✘ 纯不存在的 slug(别再猜): openai/gpt-5.6-sol(应为 openai/gpt-5 或 gpt-5-codex)
-#   → 该 key 实际只服务 OpenAI/Google/Anthropic 三族;要四族异构需换有 x-ai/deepseek 供给的 key。
+# 验证可服务性(清单存在 ≠ 可调,list-only 会 404):最小 max_tokens>=1500 实调一次,看 http200 vs 404。
+#   ★ 推理模型陷阱: gpt-5.6-sol / gemini-3.1-pro-preview 在 max_tokens 很小时推理吃光额度、content
+#     返空壳 ——【假阴性】,非不可用。核对给足 max_tokens(>=1500);正式跑 review/brainstorm 用
+#     options.max_tokens_member=3000,decide 长输出建议 >=8000(3000 下推理模型易空壳)。
+#   ✔ 实测可服务(http200): openai/gpt-5.6-sol, openai/gpt-5, openai/gpt-5-codex,
+#     google/gemini-3.1-pro-preview, google/gemini-2.5-pro, anthropic/claude-opus-4.8
+#   ✘ 在清单里但端点 404(list-only): x-ai/grok-4.5(及 grok-4.x 全系), deepseek/deepseek-v3.2
+#   → 此 key 只实际服务 OpenAI/Google/Anthropic 三族;要 xAI 第四族需换有 x-ai 供给的 key,
+#     否则 D 席 grok 会 404 → 走其 fallback(牺牲第四家族多样性)。
+#   (注:上一版备忘曾误记 openai/gpt-5.6-sol「不存在」;2026-07-12 复测为 http200 可服务,已订正。)
 
 members:
   - name: reasoning-a          # A 席: 逻辑推理/方案权衡
     seat: A
     channel: cli               # codex 走订阅,省钱
-    model: gpt-5.6-sol
+    # model 省略 → 用 codex 默认(GPT-5 级);codex(ChatGPT 账号)不接受显式 -m,给了会 400。
     cli_extra: ["-c", "model_reasoning_effort=high"]
     timeout_seconds: 240
     fallback:
-      - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}
+      - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}   # ✔ 2026-07-12 实测 http200
 
   - name: coding-b             # B 席: 代码理解/工程实现
     seat: B
@@ -50,16 +52,18 @@ members:
     model: google/gemini-3.1-pro-preview
     timeout_seconds: 240       # Gemini 系较慢,单独放宽
 
-  - name: adversarial-d        # D 席: 用户体验/反方红队
+  - name: adversarial-d        # D 席: 用户体验/反方红队(xAI 第四族,最大化错误去相关)
     seat: D
     channel: api
     protocol: openrouter
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.5       # 多数 key 为 list-only 404;仅有 x-ai 供给的 key 可调
+    fallback:                  # 无 x-ai 供给时降级到可服务模型(牺牲第四家族多样性,好过整席丢失)
+      - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}   # ✔ 2026-07-12 实测 http200
 
 # 仲裁人 = 当前 agent(带完整上下文),不在此配置,不走外部调用。
 
 options:
-  max_tokens_member: 3000
+  max_tokens_member: 3000      # review/brainstorm 够用;decide + 推理模型长输出建议调到 >=8000
   timeout_seconds: 180         # 全局默认;member 级 timeout_seconds 覆盖之
   min_successful_members: 2    # 运行时取 min(此值, 席位数),避免 L1 单委员被误杀
   grace_seconds: 30            # 达法定席位数后,给落伍者的宽限窗
