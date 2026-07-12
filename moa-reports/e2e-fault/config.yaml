@@ -1,0 +1,20 @@
+# §12.5 行为3 真实 E2E: 两席都指向不存在的模型 → 全部失败 → cmd_generate 中止。
+members:
+  - name: dead-a
+    seat: A
+    channel: api
+    protocol: openrouter
+    model: openai/this-model-does-not-exist-xyz-000
+    timeout_seconds: 30
+  - name: dead-b
+    seat: B
+    channel: api
+    protocol: openrouter
+    model: openai/another-nonexistent-model-zzz-999
+    timeout_seconds: 30
+options:
+  max_tokens_member: 500
+  timeout_seconds: 30
+  min_successful_members: 2
+  grace_seconds: 10
+  max_refine_rounds: 0

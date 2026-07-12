@@ -1,0 +1,36 @@
+# §12.4 E2E: 构造含分歧的评审。A 安全审计员大概率把"无盐快哈希存密码"标 blocker;
+# B 务实交付派被指令对任何 blocker 表态 challenge(论证本内部低危场景顶多 medium)。
+# 精炼轮里 B 的 challenge 锁住 disputed_titles;仲裁人须保留双方论据且不降级 blocker。
+members:
+  - name: sec-a
+    seat: A
+    role: security_auditor          # 内置 review 角色
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+  - name: shipper-b
+    seat: B
+    role: pragmatic_shipper         # 自定义:见 custom_roles
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+
+options:
+  max_tokens_member: 1500
+  timeout_seconds: 120
+  min_successful_members: 2
+  grace_seconds: 20
+  max_refine_rounds: 1
+
+custom_roles:
+  pragmatic_shipper: |
+    你是以"本周内必须上线"为第一优先的务实交付负责人。你认为多数安全担忧在这个仅限内网、
+    40 人可信用户的低危场景下被夸大了。评审纪律(必须遵守):
+    - 对**任何**被当作 blocker 的安全问题,你要论证在本场景下它顶多是 high 或 medium,
+      给出你的理由(为何本内部低危场景可暂缓),并把它放到"下个迭代"而非"上线前必修"。
+    - 但你不许否认问题存在——你只调整它的 severity 与紧迫度,不是说它不是问题。
+    - 精炼轮看到别人把某条标 blocker 时,如果你认为在本场景被夸大,表态 challenge 并给理由。
+    - 诚实认领:若某个问题即使在内部场景也确实致命(如明文存储/可被 40 人中任一人直接看到密码),
+      如实承认、不硬护短。区分 fact(附来源)与 judgement。
