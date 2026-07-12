@@ -24,17 +24,19 @@
 
 前提:已写好 `brief.md` + `config.yaml`(委员含 `role`;讨论型角色建议给"稳健折中"席以打破二元对立)。设发言序 `order`。
 
+> `--member <member_name>` 传的是 config 里的委员 **`name`**(如 `reasoning-a`),**不是座位号**(`A`/`B`);传座位号会得到 `--member matched nothing`。
+
 ```bash
 CFG=...; IN=...; D=moa-reports/<run>
 # 每轮 r,按 rotate(order, r) 逐席:
 #   CH2/CH3 席 → moa.py 直接派发并追加 transcript
 python skills/moa/scripts/moa.py discuss-turn --mode <m> --config $CFG --input $IN \
-  --collect-dir $D --member <seat_name> --round <r>
+  --collect-dir $D --member <member_name> --round <r>
 #   CH1 席 → 取精确 prompt,用 Agent 工具外派发子代理(禁工具/仅 JSON),把返回 JSON 存文件后 --inject 回填
 python skills/moa/scripts/moa.py discuss-prompt --mode <m> --config $CFG --input $IN \
-  --collect-dir $D --member <seat_name> --round <r>            # 打印 system/user
+  --collect-dir $D --member <member_name> --round <r>            # 打印 system/user
 #   <dispatch subagent with that exact prompt, save JSON to turn.json>
-python skills/moa/scripts/moa.py discuss-turn ... --member <seat_name> --round <r> --inject turn.json
+python skills/moa/scripts/moa.py discuss-turn ... --member <member_name> --round <r> --inject turn.json
 ```
 
 - **顺序要点**:同一轮内必须**按发言序逐条追加**——后发席的 `discuss-turn`/`discuss-prompt` 会读到此前已追加的发言。不要并行同一轮(会丢掉"后发可见前发")。
@@ -44,7 +46,7 @@ python skills/moa/scripts/moa.py discuss-turn ... --member <seat_name> --round <
 ```bash
 # 每席盲投(CH1 同样 discuss-prompt --blind 取词 → 外派发 → --inject)
 python skills/moa/scripts/moa.py discuss-blindvote --mode <m> --config $CFG --input $IN \
-  --collect-dir $D --member <seat_name> [--inject blind.json]
+  --collect-dir $D --member <member_name> [--inject blind.json]
 # 统计: 从众/假讨论/漂移/保留分歧
 python skills/moa/scripts/moa.py discuss-stats --config $CFG --collect-dir $D
 ```

@@ -28,11 +28,16 @@
 #     否则 D 席 grok 会 404 → 走其 fallback(牺牲第四家族多样性)。
 #   (注:上一版备忘曾误记 openai/gpt-5.6-sol「不存在」;2026-07-12 复测为 http200 可服务,已订正。)
 
+# 注: 下面 name 里的 reasoning/coding/fact/adversarial 只是"为何选这个模型"的助记标签(name 仅用于产物文件名);
+#     每席在各模式下的**实际角色**由 seat 字母决定(review: A=可行性质疑 B=可维护性 C=安全审计 D=用户代言;
+#     brainstorm 另一套,见 skills/moa/scripts/moa.py 的 DEFAULT_SEAT_ROLE 与 references/roles-*.md)。
+#     即 review 模式下 seat C(名 fact-c)跑的是 security_auditor,不是"事实核查";要固定角色就显式设 member.role。
 members:
-  - name: reasoning-a          # A 席: 逻辑推理/方案权衡
+  - name: reasoning-a          # A 席: 选它做逻辑推理/方案权衡(review 角色=可行性质疑者)
     seat: A
     channel: cli               # codex 走订阅,省钱
     # model 省略 → 用 codex 默认(GPT-5 级);codex(ChatGPT 账号)不接受显式 -m,给了会 400。
+    # codex_bin: codex         # 可选:codex 可执行文件名/路径,默认 "codex"(不在 PATH 或改名时才需设)
     cli_extra: ["-c", "model_reasoning_effort=high"]
     timeout_seconds: 240
     fallback:

@@ -85,6 +85,19 @@ def test_load_transcript_missing_is_empty(tmp_path):
     assert moa.load_transcript(tmp_path) == []
 
 
+def test_load_transcript_tolerates_corrupt_lines(tmp_path, capsys):
+    """N3 回归: 损坏行(中断写入 / 手工误编辑)跳过 + stderr 告警,不整场 traceback。"""
+    (tmp_path / "discussion.jsonl").write_text(
+        '{"round":1,"seat":"A","turn":{"current_stance":"x"}}\n'
+        '{corrupt not json\n'
+        '\n'  # 空行也不该崩
+        '{"round":1,"seat":"B","turn":{"current_stance":"y"}}\n',
+        encoding="utf-8")
+    loaded = moa.load_transcript(tmp_path)                 # 不抛
+    assert [t["seat"] for t in loaded] == ["A", "B"]       # 好行都在,坏行跳过
+    assert "skipped 1 corrupt line" in capsys.readouterr().err
+
+
 # ---------- 统计: 从众 / 假讨论 / 漂移 / 保留分歧 ----------
 
 def test_conformity_alert_flags_change_without_new_argument():

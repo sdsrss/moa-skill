@@ -97,6 +97,22 @@ def test_leak_check_scans_real_files_reports_clean(tmp_path, capsys):
     assert "clean" in capsys.readouterr().out
 
 
+def test_leak_check_findings_exit_code_1(tmp_path, capsys):
+    """三态退出码的第三态: 检出泄漏 → 退出码 1(CI 门禁的全部意义所在)。
+    此前只有 exit-2(0 文件)与 exit-0(clean)有测试;exit-1 若回归成 0 会给出假'clean'
+    安全承诺,测试套抓不住,故补此门。报告本身也必须脱敏。"""
+    (tmp_path / "leaky.txt").write_text(DIRTY, encoding="utf-8")
+    args = argparse.Namespace(paths=[str(tmp_path)])
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_leak_check(args)
+    assert ei.value.code == 1
+    cap = capsys.readouterr()
+    assert "clean" not in cap.out          # 检出时绝不冒充 clean
+    assert "疑似泄漏" in cap.err
+    for raw in RAW_SECRETS:
+        assert raw not in cap.err          # 门禁报告也脱敏
+
+
 def test_warn_sensitive_material_returns_hits_and_prints(capsys):
     hits = moa.warn_sensitive_material(DIRTY)
     assert len(hits) >= 4

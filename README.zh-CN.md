@@ -7,7 +7,7 @@
 原理基于 **Mixture-of-Agents（MoA）**：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术 / 事实检索）不要用。
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.3.2-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-126%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.3.3-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-137%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -206,7 +206,7 @@ key 只从环境变量读取——不落盘、不进日志 / 报告；`leak-chec
 | 模型在 OpenRouter 清单里但调用 404 | list-only：该 key 无供给 | 换 key 上真服务的模型；过代理后仍 404 = 真不服务，非代理问题 |
 | `codex ... gpt-5-codex not supported ... ChatGPT account` | codex（ChatGPT 账号）不接受显式 `-m gpt-5-codex` | CH2 席**省略 `model`**，用 codex 默认（GPT-5 级）|
 | `FAIL: output not parseable` | 模型返回非 JSON（部分便宜模型 JSON 遵从差） | 走 fallback 链或自修复；换 JSON 遵从更好的模型 |
-| `[abort] successful members < required` | 成功委员数 < `min(min_successful_members, 席位数)` | 检查 key/额度/模型可用性；阈值运行时对席位数取 min，不误杀 L1 单委员 |
+| `[abort] dispatchable members ... ok < required` | 脚本**可派发席**(CH2/CH3)成功数 < `min(min_successful_members, 可派发席数)` | 检查 key/额度/模型可用性;纯 subagent(CH1)席由仲裁人另行派发、不计入此门,合流后整体法定数由仲裁人判 |
 | `codex not found on PATH` | CH2 席位但未装 codex | 装 codex 或把该席 `channel` 改成 `api`，或配 fallback |
 | `channel=subagent must be dispatched by arbiter` | CH1 席位无 api/cli fallback，`moa.py` 不派发 | 由仲裁人用 Task 工具派发，或给该席配 api fallback |
 | 报告数字与 `stats` 不一致 | 仲裁人凭印象改写了共识度 / 数量 | 硬规则要求报告数字与 `stats` 一致；`sycophancy_alert` 为真须声明并下调置信度 |
@@ -216,7 +216,7 @@ key 只从环境变量读取——不落盘、不进日志 / 报告；`leak-chec
 ## 开发
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 126 项(行为测试 + 文档一致性校验)，无网络
+python -m pytest skills/moa/tests/ -q      # 137 项(行为测试 + 文档一致性校验)，无网络
 python skills/moa/scripts/moa.py leak-check # 密钥泄漏静态自查：命中即非零退出（预览脱敏）
 ```
 

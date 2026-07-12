@@ -181,3 +181,63 @@ def test_cli_codex_success_parses_stdout(monkeypatch):
                         lambda *a, **k: _proc(0, out=b'{"verdict":"pass"}'))
     out, parsed = moa.call_cli_codex({}, "s", "u", 5)   # last.txt 不存在 → 回退读 stdout
     assert parsed == {"verdict": "pass"}
+
+
+# ---------- 通道调度: fallback 链遍历(核心韧性承诺,此前无端到端单测) ----------
+
+def test_dispatch_channels_falls_through_to_fallback(monkeypatch):
+    """主通道挂 → 沿 fallback 链降级到下一条 api 席并成功;model_used/channel_used 反映实走的那条。"""
+    member = {"name": "a", "seat": "A", "channel": "api", "protocol": "openrouter",
+              "model": "primary-down",
+              "fallback": [{"channel": "api", "protocol": "openrouter", "model": "backup-up"}]}
+
+    def fake_repair(ccfg, system, user, temp, max_tokens, timeout, schema):
+        if ccfg["model"] == "primary-down":
+            raise moa.TransientError("primary 503", err_class="server")
+        return "{}", {"verdict": "pass"}, {"total_tokens": 3}
+
+    monkeypatch.setattr(moa, "call_with_json_repair", fake_repair)
+    res = moa._dispatch_channels(member, "r", "sys", "usr",
+                                 {"timeout_seconds": 30, "max_tokens_member": 100})
+    assert res["parsed"] == {"verdict": "pass"}
+    assert res["model_used"] == "backup-up"                 # 实走 fallback 那条
+    assert "fallback from channel=api" in res["channel_used"]
+
+
+def test_dispatch_channels_all_fail_returns_last_failure(monkeypatch):
+    """主通道 + 全部 fallback 都挂 → 返回失败席(parsed=None),带最后一次错误分类。"""
+    member = {"name": "a", "seat": "A", "channel": "api", "model": "m1",
+              "fallback": [{"channel": "api", "model": "m2"}]}
+
+    def always_fail(ccfg, *a, **k):
+        raise moa.PermanentError("404 client", err_class="client")
+
+    monkeypatch.setattr(moa, "call_with_json_repair", always_fail)
+    res = moa._dispatch_channels(member, "r", "s", "u",
+                                 {"timeout_seconds": 30, "max_tokens_member": 100})
+    assert res["parsed"] is None and res["err_class"] == "client"
+
+
+# ---------- 传输层: http_post 请求构造 + 响应解析(此前 0 覆盖,总被 stub 掉) ----------
+
+def test_http_post_builds_post_request_and_parses_json(monkeypatch):
+    """在 opener(urlopen)边界 stub,验证真实请求构造:POST / content-type / body / timeout 传参。"""
+    captured = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ok": 1}'
+
+    class FakeOpener:
+        def open(self, req, timeout=None):
+            captured.update(url=req.full_url, method=req.get_method(),
+                            ct=req.headers.get("Content-type"), body=req.data, timeout=timeout)
+            return FakeResp()
+
+    monkeypatch.setattr(moa, "_opener_for", lambda url: FakeOpener())
+    out = moa.http_post("https://x/v1/chat/completions", {"Authorization": "Bearer k"},
+                        {"model": "m", "messages": []}, timeout=42)
+    assert out == {"ok": 1}
+    assert captured["method"] == "POST" and captured["ct"] == "application/json"
+    assert captured["timeout"] == 42 and b'"model"' in captured["body"]

@@ -326,6 +326,67 @@ def test_cmd_generate_aborts_below_min_ok(tmp_path, monkeypatch):
         moa.cmd_generate(args, cfg)
 
 
+def test_cmd_generate_min_ok_scoped_to_dispatchable_not_all_members(tmp_path, monkeypatch):
+    """N1 回归: min_ok 分母是【可派发席】,不是全体席位。默认配置形态(2 纯 subagent + 2 可派发,
+    min_successful_members=2)下,两个可派发席都成功即达标——不得因'含 subagent 的全体=4、ok=2<门'
+    之类的错口径中止。旧 bug: min_ok=min(2,len(members)=4)=2,quorum_target=max(2,len(dispatchable)-1=1)=2,
+    可派发席掉一个→ok=1<2 被误 abort;修后分母=len(dispatchable)=2,掉一个仍 ok=1... 见下一个用例。"""
+    brief = tmp_path / "b.md"; brief.write_text("brief", encoding="utf-8")
+    cfg = {"members": [{"name": "sub-b", "seat": "B", "channel": "subagent", "model": "m"},
+                       {"name": "sub-d", "seat": "D", "channel": "subagent", "model": "m"},
+                       {"name": "api-a", "seat": "A", "channel": "api", "model": "m"},
+                       {"name": "api-c", "seat": "C", "channel": "api", "model": "m"}],
+           "options": {"timeout_seconds": 60, "max_tokens_member": 100,
+                       "min_successful_members": 2, "grace_seconds": 0}}
+    monkeypatch.setattr(moa, "run_member_generate",
+                        lambda m, *a: {"name": m["name"], "seat": m["seat"], "role": "r",
+                                       "model_used": "m", "channel_used": "api", "raw": "{}",
+                                       "parsed": {"verdict": "pass"}, "usage": None,
+                                       "latency_s": 0.0, "error": None, "err_class": None})
+    args = types.SimpleNamespace(input=str(brief), member=None,
+                                 collect_dir=str(tmp_path / "out"), mode="review", topic="")
+    moa.cmd_generate(args, cfg)  # 不得抛 SystemExit: 两个可派发席成功即达标
+    # 只有两个可派发席落盘(subagent 席交仲裁人,moa.py 跳过)
+    written = sorted(p.name for p in (tmp_path / "out").glob("member_*.json"))
+    assert written == ["member_api-a.json", "member_api-c.json"]
+
+
+def test_cmd_generate_all_subagent_exits_clean_not_abort(tmp_path, capsys):
+    """N1 回归: 全 CH1 配置(无可派发席)干净返回,不以'顾问不足'abort。"""
+    brief = tmp_path / "b.md"; brief.write_text("brief", encoding="utf-8")
+    cfg = {"members": [{"name": "sub-a", "seat": "A", "channel": "subagent", "model": "m"},
+                       {"name": "sub-b", "seat": "B", "channel": "subagent", "model": "m"}],
+           "options": {"timeout_seconds": 60, "max_tokens_member": 100,
+                       "min_successful_members": 2, "grace_seconds": 0}}
+    args = types.SimpleNamespace(input=str(brief), member=None,
+                                 collect_dir=str(tmp_path / "out"), mode="review", topic="")
+    moa.cmd_generate(args, cfg)  # 不抛 SystemExit
+    assert "all seats are channel=subagent" in capsys.readouterr().err
+
+
+def test_cmd_generate_still_aborts_when_dispatchable_below_min_ok(tmp_path, monkeypatch):
+    """N1 反向: 分母改了但 abort 门仍有效——可派发席不足 min_ok 时依旧中止。
+    2 可派发席、min_successful_members=2、只有 1 席成功 → ok=1<min_ok=min(2,2)=2 → abort。"""
+    brief = tmp_path / "b.md"; brief.write_text("brief", encoding="utf-8")
+    cfg = {"members": [{"name": "api-a", "seat": "A", "channel": "api", "model": "m"},
+                       {"name": "api-c", "seat": "C", "channel": "api", "model": "m"}],
+           "options": {"timeout_seconds": 60, "max_tokens_member": 100,
+                       "min_successful_members": 2, "grace_seconds": 0}}
+
+    def one_ok_one_fail(m, *a):
+        if m["name"] == "api-a":
+            return {"name": m["name"], "seat": m["seat"], "role": "r", "model_used": "m",
+                    "channel_used": "api", "raw": "{}", "parsed": {"verdict": "pass"},
+                    "usage": None, "latency_s": 0.0, "error": None, "err_class": None}
+        return moa._fail(m, "r", "boom", "transient")
+
+    monkeypatch.setattr(moa, "run_member_generate", one_ok_one_fail)
+    args = types.SimpleNamespace(input=str(brief), member=None,
+                                 collect_dir=str(tmp_path / "out"), mode="review", topic="")
+    with pytest.raises(SystemExit):
+        moa.cmd_generate(args, cfg)
+
+
 # ---------- 统计块: 按模式分支 + 分母只计成功 + degraded ----------
 
 def _res(name, seat, parsed, err_class=None):
@@ -518,6 +579,40 @@ def test_dispatch_grace_returns_without_joining_straggler():
     by = {r["name"]: r for r in res}
     assert by["fast1"]["parsed"] and by["fast2"]["parsed"]
     assert by["slow"]["err_class"] == "skipped_grace" and by["slow"]["parsed"] is None
+
+
+# ---------- main() argparse 接线冒烟(此前 0 覆盖) ----------
+
+def test_main_stats_routes_without_config(tmp_path, monkeypatch, capsys):
+    """接线: stats 走免-config 特例分支(main() 不加载委员会 config)。"""
+    (tmp_path / "member_a.json").write_text(
+        json.dumps({"name": "a", "seat": "A", "model_used": "m", "channel_used": "api",
+                    "parsed": {"verdict": "pass", "confidence": 0.5, "issues": []}}),
+        encoding="utf-8")
+    monkeypatch.setattr(sys, "argv",
+                        ["moa.py", "stats", "--mode", "review", "--collect-dir", str(tmp_path)])
+    moa.main()                                            # 不因缺 config 抛错
+    assert '"members_ok": 1' in capsys.readouterr().out
+
+
+def test_main_leak_check_routes_without_config(tmp_path, monkeypatch):
+    """接线: leak-check 走免-config 分支;空目录 → 0 文件 → 退出码 2。"""
+    monkeypatch.setattr(sys, "argv", ["moa.py", "leak-check", str(tmp_path)])
+    with pytest.raises(SystemExit) as ei:
+        moa.main()
+    assert ei.value.code == 2
+
+
+def test_main_refine_forbids_example_fallback(tmp_path, monkeypatch):
+    """接线(P1-2 不变量的调用点): refine 在 no_fallback 集合内 → 无 config.yaml 时禁止回退示例配置。"""
+    brief = tmp_path / "b.md"; brief.write_text("x", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)                           # cwd 无 config.yaml
+    monkeypatch.setattr(sys, "argv",
+                        ["moa.py", "refine", "--input", str(brief),
+                         "--collect-dir", str(tmp_path), "--round", "1"])
+    with pytest.raises(SystemExit) as ei:
+        moa.main()
+    assert "禁止回退" in str(ei.value)
 
 
 # ---------- min_successful 动态阈值(逻辑) ----------

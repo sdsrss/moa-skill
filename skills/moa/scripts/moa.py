@@ -530,15 +530,23 @@ def run_member_blindvote(member, mode, material, opts, custom_roles):
 
 
 def load_transcript(collect_dir: Path) -> list:
-    """读 discussion.jsonl(每行一个回合信封);不存在则空。"""
+    """读 discussion.jsonl(每行一个回合信封);不存在则空。
+    损坏行(中断写入 / 手工误编辑)跳过并到 stderr 计数告警,不让整场讨论因一行崩溃(修 N3)——
+    与 leak_check 对不可读文件的容错风格一致:宁可少一回合,不要 discuss-stats 直接 traceback。"""
     p = Path(collect_dir) / "discussion.jsonl"
     if not p.exists():
         return []
-    out = []
+    out, bad = [], 0
     for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        try:
             out.append(json.loads(line))
+        except json.JSONDecodeError:
+            bad += 1
+    if bad:
+        print(f"[discuss] warning: skipped {bad} corrupt line(s) in {p}", file=sys.stderr)
     return out
 
 
@@ -1128,8 +1136,19 @@ def cmd_generate(args, cfg):
         print(f"  - {m['name']} (seat {m.get('seat','?')}): channel=subagent, 交由仲裁人脚本外派发",
               file=sys.stderr)
 
+    # 全 CH1 配置: moa.py 无可派发席,整会交仲裁人脚本外派发。这不是"顾问不足",干净退出即可
+    # (修 N1: 旧代码此处落到下方 min_ok 门,以 abort 收场,措辞误导仲裁人放弃本可成立的委员会)。
+    if not dispatchable:
+        print("[generate] no api/cli members to dispatch; all seats are channel=subagent "
+              "(arbiter-dispatched). Nothing for moa.py to run — 交由仲裁人 Task 外派发。",
+              file=sys.stderr)
+        return
     print(f"[generate] dispatching {len(dispatchable)} members ({args.mode}) ...", file=sys.stderr)
-    min_ok = min(opts.get("min_successful_members", 2), max(1, len(members)))
+    # 法定数(min_ok)只对【本脚本可派发席】负责,故分母用 len(dispatchable) 而非 len(members)
+    # (修 N1: 旧代码分母含纯 subagent 席,但 ok 只统计脚本派发结果——默认 config 恰是 2 subagent +
+    # 2 可派发,可派发席掉一个就 ok=1<min_ok=2 被误 abort,废掉 fallback/quorum 想保的降级续跑。
+    # 纯 subagent 席由仲裁人脚本外派发,合流后含 CH1 的整体法定数由仲裁人在 collect-dir 上判)。
+    min_ok = min(opts.get("min_successful_members", 2), max(1, len(dispatchable)))
     quorum_target = max(min_ok, len(dispatchable) - 1)  # 达此数后给落伍者宽限
     grace_s = opts.get("grace_seconds", 30)
 
@@ -1145,10 +1164,10 @@ def cmd_generate(args, cfg):
         quorum_target, grace_s, on_done=_log_write)
 
     ok = [r for r in results if r["parsed"]]
-    # subagent 席位可能由仲裁人另行写入,总法定数按 dispatchable 判定(仲裁人合流后再评估整体)
+    # subagent 席位可能由仲裁人另行写入,此门只判本脚本可派发席(min_ok 分母亦为 dispatchable,见上)
     if len(ok) < min_ok:
-        sys.exit(f"[abort] successful members {len(ok)} < required {min_ok} — "
-                 f"顾问不足的结论不配称为委员会评审。")
+        sys.exit(f"[abort] dispatchable members {len(ok)} ok < required {min_ok} — "
+                 f"顾问不足的结论不配称为委员会评审(纯 subagent 席由仲裁人另行派发,不计入此数)。")
     degraded = len(ok) < len(dispatchable)
     tag = " [DEGRADED: 部分席位缺席,阵容与置信度见 stats/report]" if degraded else ""
     print(f"[generate] done: {len(ok)}/{len(dispatchable)} ok{tag} -> {collect}", file=sys.stderr)
@@ -1224,7 +1243,7 @@ def cmd_refine(args, cfg):
         print(f"  - {r['name']} ({r['role']}, {r['latency_s']}s) via {r.get('channel_used') or '-'}: {status}",
               file=sys.stderr)
 
-    min_ok = min(opts.get("min_successful_members", 2), max(1, len(members)))
+    min_ok = min(opts.get("min_successful_members", 2), max(1, len(dispatchable)))  # 同 N1: 分母用 dispatchable
     quorum_target = max(min_ok, len(dispatchable) - 1)
     results = dispatch_with_quorum(
         dispatchable, one, quorum_target, opts.get("grace_seconds", 30), on_done=_log_write)
@@ -1308,7 +1327,7 @@ def cmd_discuss_blindvote(args, cfg):
           "channel_used": res.get("channel_used"), "model_used": res.get("model_used"),
           "vote": res.get("parsed"), "usage": res.get("usage"),
           "error": res.get("error"), "err_class": res.get("err_class")}
-    out = collect / f"blindvote_{res.get('seat')}.json"
+    out = collect / f"blindvote_{_safe_name(str(res.get('seat')))}.json"  # 修 N4: seat 也过路径穿越门
     out.write_text(json.dumps(bv, ensure_ascii=False, indent=1), encoding="utf-8")
     status = "OK" if res["parsed"] else f"FAIL[{res['err_class']}]"
     print(f"[blindvote] {m['name']} ({res['role']}): {status} -> {out}", file=sys.stderr)
