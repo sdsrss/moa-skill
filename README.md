@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.1.2-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-96%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.1.7-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-111%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -29,7 +29,9 @@ Built on **Mixture-of-Agents (MoA)**: different models have different blind spot
 
 ## Why MoA Skill
 
-One model reviewing its own work is one set of blind spots. MoA Skill convenes **four independent, heterogeneous models** (OpenAI / Anthropic / Google / xAI families) that never see each other's raw output during generation, then lets **your current agent — holding full context — arbitrate** under hard anti-groupthink rules. You get a second, third, fourth opinion that is *actually independent*, with disagreements surfaced rather than averaged away.
+One model reviewing its own work is one set of blind spots. MoA Skill convenes **up to four independent, heterogeneous models** across the OpenAI / Anthropic / Google / xAI families that never see each other's raw output during generation, then lets **your current agent — holding full context — arbitrate** under hard anti-groupthink rules. You get a second, third, fourth opinion that is *actually independent*, with disagreements surfaced rather than averaged away.
+
+> **On the default roster:** the shipped `config.example.yaml` fields three families — OpenAI (codex) + Anthropic (Opus) + Google (Gemini) — plus a fourth **role-differentiated Self-MoA seat** (a second Anthropic model in an adversarial role). The fourth *family*, xAI/Grok, is opt-in: it needs an OpenRouter key with x-ai supply (many keys return list-only 404 for Grok), so swap it in per the caveats in [`config.example.yaml`](skills/moa/assets/config.example.yaml). Family count is a config choice, not a hard-coded four.
 
 It is a **committee you summon on demand — not an auto-development pipeline.** Coding and fixing stay with your main agent; MoA is for the judgment-dense nodes: review, decision, arbitration, brainstorming.
 
@@ -37,12 +39,12 @@ It is a **committee you summon on demand — not an auto-development pipeline.**
 
 ## Installation
 
-MoA Skill ships as a **Claude Code plugin** (manifest + `skills/`). Claude Code auto-discovers `skills/`.
+MoA Skill installs as a **Claude Code skill** by copying it into `~/.claude/skills/`, which Claude Code auto-discovers. A `.claude-plugin/plugin.json` manifest is included for future marketplace distribution, but **no marketplace is wired yet**, so use the direct-copy method below.
 
 ```bash
-# 1. Get the repo (install as a Claude Code plugin, or copy the skill directly)
+# 1. Get the repo and copy the skill into place (direct-copy install)
 git clone https://github.com/sdsrss/moa-skill.git
-cp -r moa-skill/skills/moa ~/.claude/skills/moa      # direct-copy install
+cp -r moa-skill/skills/moa ~/.claude/skills/moa      # Claude Code auto-discovers ~/.claude/skills/
 
 # 2. Runtime dependency (the HTTP layer is pure stdlib)
 pip install pyyaml
@@ -59,7 +61,7 @@ export OPENROUTER_API_KEY=...      # recommended: one key reaches every provider
 cp skills/moa/assets/config.example.yaml config.yaml   # then edit models/channels
 ```
 
-`config.yaml` defines members (`name` / `seat` / `channel` / `model` / `fallback` / `timeout`) and `options` (`max_tokens_member` / `min_successful_members` / `grace_seconds` / `max_refine_rounds`). The arbiter is your current agent — **it is not in the config** and makes no external calls. Model IDs churn fast; verify once with `dry-run` before a real run. The script auto-detects `http_proxy` / `https_proxy` / `no_proxy` and routes API calls through a proxy when present.
+`config.yaml` defines members (`name` / `seat` / `channel` / `model` / `fallback` / `timeout`) and `options` (`max_tokens_member` / `min_successful_members` / `grace_seconds`). The arbiter is your current agent — **it is not in the config** and makes no external calls. Model IDs churn fast; verify once with `dry-run` before a real run. The script auto-detects `http_proxy` / `https_proxy` / `no_proxy` and routes API calls through a proxy when present.
 
 ---
 
@@ -87,7 +89,7 @@ cp skills/moa/assets/config.example.yaml config.yaml   # then edit models/channe
 
 ### Three convening scales
 
-- **`full`** (manual `/moa <material>`) — fixed 4 top-tier heterogeneous seats + arbiter.
+- **`full`** (manual `/moa <material>`) — fixed 4 top-tier seats + arbiter (3 families + a Self-MoA seat by default).
 - **`auto`** (keyword / self-invoked) — orchestrator picks seat count, models, and pipeline by **scenario × difficulty × stage** (`references/routing.md`).
 - **`custom`** (`--members N --models "id1,id2"`) — repeat one model = active **Self-MoA**.
 
@@ -99,7 +101,7 @@ Exponential backoff on 5xx/429 · one-shot JSON self-repair · dynamic quorum (`
 
 ## Highlights
 
-- 🧩 **Truly independent second opinions** — four model families, blind generation, so blind spots are de-correlated instead of echoed.
+- 🧩 **Truly independent second opinions** — up to four model families, blind generation, so blind spots are de-correlated instead of echoed (default ships three families + a Self-MoA seat; see the note above).
 - ⚖️ **Arbiter with full context + anti-pollution clamps** — the aggregator is your main agent, kept honest by a statistics block, a falsification gate, and no-hedge / no-blocker-downgrade hard rules.
 - 💸 **Cost-adaptive, not always-on** — L0 gate refuses trivial questions; `scenario × difficulty × stage` routing; `--dry-run` shows the roster, channels, proxy state, and cost estimate *before* you spend a token.
 - 🛡️ **Anti-groupthink discipline stack** — blind isolation, anonymous cross-review, same-source consensus de-dup, sycophancy counter, three-state abstention, outlier protection, low-confidence hand-back.
@@ -154,13 +156,13 @@ Artifacts: `member_<name>.json` (per-member structured opinions), `stats.json` (
 
 Sequential speaking, later speakers see earlier turns (an explicit exception to blind review), multi-round + closing blind vote — highest cost, highest conformity risk. Use only for high-value irreversible decisions when the user asks to "really debate it" (lighter disagreements → use `refine`). The arbiter orchestrates round by round; `moa.py` provides `discuss-turn` / `discuss-prompt` / `discuss-blindvote` / `discuss-stats`. Three anti-conformity hedges: speaking-order rotation, per-turn `changed_by_new_argument` tagging (→ pseudo-discussion detection), and closing blind-vote drift detection. See [`references/discuss.md`](skills/moa/references/discuss.md).
 
-> **Real end-to-end evidence** lives in [`moa-reports/`](moa-reports/): document review, multi-option decision, brainstorm, round-table discussion (2 rounds + blind vote), Self-MoA, fault injection, and an `auto` top-tier run (4 heterogeneous seats across all three channels). Top-tier model slugs have gotchas — see the caveats in [`config.example.yaml`](skills/moa/assets/config.example.yaml).
+> **Real end-to-end evidence** lives in [`moa-reports/`](moa-reports/): document review, multi-option decision, brainstorm, round-table discussion (2 rounds + blind vote), Self-MoA, fault injection, and an `auto` top-tier run (4 seats across all three channels; the 4th seat is a second OpenAI model as xAI was unavailable on the test key — not fully heterogeneous). Top-tier model slugs have gotchas — see the caveats in [`config.example.yaml`](skills/moa/assets/config.example.yaml).
 
 ---
 
 ## Cost
 
-Tokens run a few × a single model. Measured (2 seats + 1 refine round) = **4.79× baseline**; with the default config (seats A/B on subscription channels) the user-paid multiple is ≈ 4.79× ≤ the 7× target. **All-CH3 four seats + refine ≈ 9.6×** (over target — see [`moa-reports/cost-m4/COST-NOTE.md`](moa-reports/cost-m4/COST-NOTE.md)). Always `dry-run` and show the estimate before a real run.
+Tokens run a few × a single model. Measured (2 billed seats + 1 refine round, on cheap non-reasoning models — see [`COST-NOTE.md`](moa-reports/cost-m4/COST-NOTE.md)) = **4.79× baseline**. The **shipped default puts only seat C on a billed CH3 channel** (A=codex, B & D=subscription subagents), so the user-paid token multiple is lower still. **All-CH3 four seats + refine ≈ 9.6×** (over the 7× target). Always `dry-run` and show the estimate before a real run.
 
 ---
 
@@ -194,7 +196,7 @@ Per the MoA paper, aggregators benefit from full context while proposers don't �
 ## Development
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 96 unit/integration/trigger/routing/fault/discuss/safety cases, no network
+python -m pytest skills/moa/tests/ -q      # 111 unit/integration/trigger/routing/fault/discuss/safety cases, no network
 python skills/moa/scripts/moa.py leak-check # static secret-leak self-check: non-zero exit on hit (preview redacted)
 ```
 

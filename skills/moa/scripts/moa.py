@@ -398,8 +398,9 @@ def _seat_role(member, mode):
     return member.get("role") or DEFAULT_SEAT_ROLE.get((mode, seat)) or seat
 
 
-def _dispatch_channels(member, role_key, system, user, opts):
-    """按 fallback 链跑 api/cli 通道,返回结果 dict。generate 与 refine 共用此调度。"""
+def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
+    """按 fallback 链跑 api/cli 通道,返回结果 dict。generate 与 refine 共用此调度。
+    default_temp: 未设 member.temperature_generate 时的默认温度;brainstorm 传更高值发散(P1-4)。"""
     seat = member.get("seat", "?")
     tries = resolve_channel(member)
     if not tries:
@@ -418,7 +419,7 @@ def _dispatch_channels(member, role_key, system, user, opts):
                     raise TransientError("codex output not valid JSON", err_class="parse")
             else:
                 raw, parsed, usage = call_with_json_repair(
-                    ccfg, system, user, member.get("temperature_generate", 0.3),
+                    ccfg, system, user, member.get("temperature_generate", default_temp),
                     opts["max_tokens_member"], timeout, None)
             return {
                 "name": member["name"], "seat": seat, "role": role_key,
@@ -446,7 +447,10 @@ def run_member_generate(member, mode, material, topic, opts, custom_roles):
         user = f"背景材料:\n\n{material}\n\n头脑风暴主题: {topic}"
     else:
         user = f"评审材料如下:\n\n{material}"
-    return _dispatch_channels(member, role_key, system, user, opts)
+    # brainstorm 求发散: 未显式设温时默认 0.9(P1-4,兑现 roles-brainstorm.md「高 temperature」);
+    # review/decide 求稳定判断,默认 0.3。member.temperature_generate 显式设置仍优先。
+    default_temp = 0.9 if mode == "brainstorm" else 0.3
+    return _dispatch_channels(member, role_key, system, user, opts, default_temp)
 
 
 def run_member_refine(member, mode, material, own_prior, others_prior, opts, custom_roles):
@@ -588,9 +592,17 @@ def parallel_members(members, fn, max_workers=None):
 def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     """Quorum 宽限窗(design.md §10): 存活委员数达 quorum_target 后,给仍在跑的落伍者
     grace_s 秒宽限;超时者标 skipped_grace(不算失败)。每完成一个即回调 on_done(res) 落盘,
-    保证即便落伍者拖尾,collect-dir 也已有法定结果。返回按 members 原序的结果列表。"""
+    保证即便落伍者拖尾,collect-dir 也已有法定结果。返回按 members 原序的结果列表。
+
+    止损语义(修 P0-1): 宽限到期必须【立即交还控制权】,不得 join 落伍线程。此前用
+    `with ThreadPoolExecutor` 管理,块退出隐式 shutdown(wait=True) 会 join 全部线程,
+    使宽限窗形同虚设(实测 3 席 grace=0.5s 仍 wall=6s)。现改手动管理: 到期
+    shutdown(wait=False),仲裁流程即刻拿到法定结果继续。落伍线程受 member 级 timeout
+    约束在后台自然了结(不无限拖尾),不因此丢失总流程时间。"""
     results = {}
-    with ThreadPoolExecutor(max_workers=max(1, len(members))) as ex:
+    ex = ThreadPoolExecutor(max_workers=max(1, len(members)))
+    abandoned = False
+    try:
         futs = {ex.submit(fn, m): m for m in members}
         pending = set(futs)
         ok = 0
@@ -601,15 +613,15 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                 timeout = max(0.0, grace_deadline - time.monotonic())
             done, pending = concurrent.futures.wait(
                 pending, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
-            if not done and grace_deadline is not None:  # 宽限到期
+            if not done and grace_deadline is not None:  # 宽限到期: 放弃落伍者, 立即返回
                 for fut in list(pending):
                     m = futs[fut]
                     r = _skipped_grace(m)
                     results[m["name"]] = r
                     if on_done:
                         on_done(r)
-                    fut.cancel()
-                ex.shutdown(wait=False, cancel_futures=True)
+                    fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
+                abandoned = True
                 break
             for fut in done:
                 m = futs[fut]
@@ -621,6 +633,9 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                     ok += 1
             if grace_deadline is None and ok >= quorum_target and pending:
                 grace_deadline = time.monotonic() + grace_s
+    finally:
+        # abandoned=True → wait=False 立即交还控制权(不 join 落伍线程); 正常完成 → wait=True。
+        ex.shutdown(wait=not abandoned)
     return [results[m["name"]] for m in members if m["name"] in results]
 
 
@@ -1000,15 +1015,46 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
 
 # ---------- 主流程 ----------
 
-def resolve_config(path_arg):
+def resolve_config(path_arg, allow_example_fallback=True):
+    """--config 显式给出则用它;否则找 cwd/config.yaml。二者皆无时:
+    generate/dry-run 允许回退到 assets/config.example.yaml(首跑体验);
+    refine/discuss-* 禁止回退(allow_example_fallback=False)——其语义依赖与生成轮【同一份】
+    config,静默换成示例委员会会写出错席位产物、污染 stats(修 P1-2,mem #10096)。"""
     p = Path(path_arg) if path_arg else Path("config.yaml")
     if p.exists():
         return yaml.safe_load(p.read_text(encoding="utf-8"))
+    if not allow_example_fallback:
+        sys.exit(f"[config] {p} 不存在,且此阶段(refine/discuss)禁止回退到示例配置——"
+                 f"请用 --config 指定与 generate 同一份 config.yaml,否则会用错委员会污染产物。")
     example = SKILL_ROOT / "assets" / "config.example.yaml"
     if example.exists():
         print(f"[hint] {p} not found, using assets/config.example.yaml", file=sys.stderr)
         return yaml.safe_load(example.read_text(encoding="utf-8"))
     sys.exit(f"config not found: {p}. Copy assets/config.example.yaml to config.yaml and edit.")
+
+
+def validate_config(cfg):
+    """最小 schema 校验(修 P1-1 / C3): 缺关键字段给指名报错,而非裸 KeyError/traceback。
+    只查会导致运行时崩溃的硬约束,不做全字段校验(配置层刻意宽松,允许自定义键)。"""
+    if not isinstance(cfg, dict):
+        sys.exit("[config] 顶层必须是 YAML 映射(dict);参照 assets/config.example.yaml")
+    members = cfg.get("members")
+    if not isinstance(members, list) or not members:
+        sys.exit("[config] 缺 members 列表(至少 1 个委员);参照 assets/config.example.yaml")
+    names = []
+    for i, m in enumerate(members):
+        if not isinstance(m, dict) or not m.get("name"):
+            sys.exit(f"[config] members[{i}] 缺 name 字段")
+        ch = m.get("channel", "api")
+        if ch not in ("api", "cli", "subagent"):
+            sys.exit(f"[config] members[{i}] ({m.get('name')}) channel={ch!r} 非法(应为 api/cli/subagent)")
+        names.append(m["name"])
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        sys.exit(f"[config] member name 重复: {', '.join(dups)}——产物按 name 落盘会互相覆盖,请改唯一名")
+    if not isinstance(cfg.get("options"), dict):
+        sys.exit("[config] 缺 options 块(max_tokens_member/timeout_seconds/min_successful_members 等);"
+                 "参照 assets/config.example.yaml")
 
 
 # ---------- custom 模式: --members/--models 命令行入口 ----------
@@ -1266,8 +1312,17 @@ def cmd_dry_run(args, cfg):
 
 
 def cmd_leak_check(args):
-    """静态自查: 扫描产物/文档/配置有无误落盘的密钥/凭据。命中即非零退出(供 CI/收尾门禁)。"""
+    """静态自查: 扫描产物/文档/配置有无误落盘的密钥/凭据。命中即非零退出(供 CI/收尾门禁)。
+    门禁不变量(修 P0-2): 必须区分「扫过且干净」与「一个文件都没扫到」。默认扫描面全是相对
+    路径,从非项目根目录运行时无一存在——旧逻辑会静默打 clean,给出假阴性安全承诺。现先数
+    实际可扫文件数,为 0 时以退出码 2 报错(区别于 clean=0 / 命中=1),不再冒充干净。"""
     paths = args.paths or _LEAK_SCAN_DEFAULT
+    scanned = sum(1 for root in paths if Path(root).exists()
+                  for _ in _iter_text_files(Path(root)))
+    if scanned == 0:
+        print(f"[leak-check] ✗ 未扫描到任何文件 (paths: {', '.join(paths)}) — 路径不存在或为空。"
+              f"请在项目根目录运行,或用 `leak-check <path>...` 显式指定要扫描的路径。", file=sys.stderr)
+        sys.exit(2)
     findings = leak_check(paths)
     if not findings:
         print(f"[leak-check] clean: 未检出疑似密钥/凭据 (scanned: {', '.join(paths)})")
@@ -1331,12 +1386,18 @@ def main():
     if args.phase == "leak-check":       # 静态自查不需要 config
         cmd_leak_check(args)
         return
-    cfg = resolve_config(getattr(args, "config", None))
+    if args.phase in ("stats", "discuss-stats"):  # 只读产物,不需要委员会 config(修 P1-2)
+        {"stats": cmd_stats, "discuss-stats": cmd_discuss_stats}[args.phase](args, None)
+        return
+    # refine/discuss-* 依赖与 generate 同一份 config,禁止静默回退到示例配置(修 P1-2)
+    no_fallback = args.phase in ("refine", "discuss-turn", "discuss-prompt", "discuss-blindvote")
+    cfg = resolve_config(getattr(args, "config", None), allow_example_fallback=not no_fallback)
     cfg = apply_custom_committee(cfg, args)   # --models 给了就覆盖 members(custom 模式)
+    validate_config(cfg)                      # 最小 schema 校验,缺字段指名报错(修 P1-1)
     {"generate": cmd_generate, "refine": cmd_refine,
      "discuss-turn": cmd_discuss_turn, "discuss-prompt": cmd_discuss_prompt,
-     "discuss-blindvote": cmd_discuss_blindvote, "discuss-stats": cmd_discuss_stats,
-     "stats": cmd_stats, "dry-run": cmd_dry_run}[args.phase](args, cfg)
+     "discuss-blindvote": cmd_discuss_blindvote,
+     "dry-run": cmd_dry_run}[args.phase](args, cfg)
 
 
 if __name__ == "__main__":

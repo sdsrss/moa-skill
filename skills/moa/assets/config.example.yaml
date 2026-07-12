@@ -70,7 +70,9 @@ options:
   timeout_seconds: 180         # 全局默认;member 级 timeout_seconds 覆盖之
   min_successful_members: 2    # 运行时取 min(此值, 席位数),避免 L1 单委员被误杀
   grace_seconds: 30            # 达法定席位数后,给落伍者的宽限窗
-  max_refine_rounds: 2
+  # max_refine_rounds: 2       # 仅供仲裁人参考的约定值,脚本不消费(轮数由 CLI --round / --refine-rounds 决定)
+  # 温度: 未设 member.temperature_generate 时,脚本按模式取默认——brainstorm=0.9(求发散),
+  # review/decide=0.3(求稳定判断)。要覆盖就在 member 上显式设 temperature_generate。
 
 custom_roles: {}               # 内联自定义角色。键名填入 member.role 即生效。
 # custom_roles:

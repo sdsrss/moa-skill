@@ -7,6 +7,7 @@
 import json
 import os
 import sys
+import threading
 import time
 import types
 import urllib.error
@@ -188,6 +189,72 @@ def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     assert res["err_class"] is None
 
 
+# ---------- P1-1: config 最小 schema 校验(缺字段指名报错,非裸 KeyError) ----------
+
+@pytest.mark.parametrize("cfg", [
+    {"members": [{"name": "a", "channel": "api"}]},          # 缺 options
+    {"options": {}},                                          # 缺 members
+    {"members": [], "options": {}},                           # members 空
+    {"members": [{"channel": "api"}], "options": {}},         # member 缺 name
+    {"members": [{"name": "x", "channel": "bogus"}], "options": {}},  # channel 非法
+    {"members": [{"name": "x"}, {"name": "x"}], "options": {}},       # name 重复(会互相覆盖)
+])
+def test_validate_config_rejects_broken(cfg):
+    with pytest.raises(SystemExit):
+        moa.validate_config(cfg)
+
+
+def test_validate_config_accepts_valid():
+    moa.validate_config({"members": [{"name": "a", "channel": "api"},
+                                     {"name": "b", "channel": "subagent"},
+                                     {"name": "c"}],  # channel 省略默认 api
+                         "options": {"max_tokens_member": 100}})
+
+
+# ---------- P1-2: refine/discuss 禁止静默回退示例配置 ----------
+
+def test_resolve_config_refuses_example_fallback(tmp_path):
+    missing = tmp_path / "nope.yaml"
+    with pytest.raises(SystemExit):
+        moa.resolve_config(str(missing), allow_example_fallback=False)
+
+
+def test_resolve_config_allows_example_fallback_for_generate(tmp_path):
+    missing = tmp_path / "nope.yaml"
+    cfg = moa.resolve_config(str(missing), allow_example_fallback=True)
+    assert isinstance(cfg, dict) and cfg.get("members")  # 回退到 assets/config.example.yaml
+
+
+# ---------- P1-4: brainstorm 默认高温发散; 显式温度优先 ----------
+
+def _capture_temp(monkeypatch):
+    seen = {}
+    def fake_repair(cfg, system, user, temp, max_tokens, timeout, schema=None):
+        seen["temp"] = temp
+        return '{"ideas":[]}', {"ideas": []}, {}
+    monkeypatch.setattr(moa, "call_with_json_repair", fake_repair)
+    return seen
+
+
+def test_brainstorm_defaults_high_temp_review_low(monkeypatch):
+    seen = _capture_temp(monkeypatch)
+    member = {"name": "radical-a", "seat": "A", "channel": "api", "model": "m"}
+    opts = {"timeout_seconds": 60, "max_tokens_member": 100}
+    moa.run_member_generate(member, "brainstorm", "material", "topic", opts, {})
+    assert seen["temp"] == 0.9          # 发散
+    moa.run_member_generate(member, "review", "material", "", opts, {})
+    assert seen["temp"] == 0.3          # 稳定判断
+
+
+def test_explicit_temperature_overrides_mode_default(monkeypatch):
+    seen = _capture_temp(monkeypatch)
+    member = {"name": "r", "seat": "A", "channel": "api", "model": "m",
+              "temperature_generate": 0.1}
+    opts = {"timeout_seconds": 60, "max_tokens_member": 100}
+    moa.run_member_generate(member, "brainstorm", "m", "t", opts, {})
+    assert seen["temp"] == 0.1          # member 显式设置优先于模式默认
+
+
 # ---------- 统计块: 按模式分支 + 分母只计成功 + degraded ----------
 
 def _res(name, seat, parsed, err_class=None):
@@ -355,6 +422,31 @@ def test_dispatch_no_grace_when_all_fast():
                     "model_used": "m", "err_class": None, "error": None}
     res = moa.dispatch_with_quorum(members, fn, quorum_target=1, grace_s=5.0)
     assert all(r["parsed"] for r in res) and len(res) == 2
+
+
+def test_dispatch_grace_returns_without_joining_straggler():
+    """P0-1 回归: 宽限到期必须【立即返回】, 不 join 落伍线程。
+    旧 `with ThreadPoolExecutor` 实现块退出隐式 shutdown(wait=True) 会 join 全部线程,
+    使 wall≈落伍者时长、宽限窗形同虚设。此测断言 wall 远小于落伍者阻塞时长。"""
+    release = threading.Event()
+    members = [{"name": "fast1", "seat": "A"}, {"name": "fast2", "seat": "B"},
+               {"name": "slow", "seat": "C"}]
+
+    def fn(m):
+        if m["name"] == "slow":
+            release.wait(timeout=5.0)  # 阻塞直到测试放行, 模拟落伍者
+        return {"name": m["name"], "seat": m["seat"], "parsed": {"ok": 1},
+                "role": "r", "channel_used": "api", "latency_s": 0.0,
+                "model_used": "m", "err_class": None, "error": None}
+
+    t0 = time.monotonic()
+    res = moa.dispatch_with_quorum(members, fn, quorum_target=2, grace_s=0.2)
+    elapsed = time.monotonic() - t0
+    release.set()  # 放行落伍线程, 避免拖累后续用例/进程退出
+    assert elapsed < 1.5, f"宽限到期未立即返回 (wall={elapsed:.1f}s) — 疑似又在 join 落伍线程"
+    by = {r["name"]: r for r in res}
+    assert by["fast1"]["parsed"] and by["fast2"]["parsed"]
+    assert by["slow"]["err_class"] == "skipped_grace" and by["slow"]["parsed"] is None
 
 
 # ---------- min_successful 动态阈值(逻辑) ----------

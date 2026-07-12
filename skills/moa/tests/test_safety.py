@@ -4,8 +4,11 @@
 注意: 用例里的假密钥所在行不能含 fake/test/example/... 等占位符提示词,
 否则会被 _PLACEHOLDER_HINTS 正确抑制,反而测不到检出路径。
 """
+import argparse
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import moa  # noqa: E402
@@ -72,6 +75,26 @@ def test_leak_check_flags_dirty_skips_clean_and_binary(tmp_path):
 
 def test_leak_check_missing_path_is_noop():
     assert moa.leak_check(["nonexistent-dir-xyz"]) == []
+
+
+def test_leak_check_zero_files_scanned_errors_not_clean(capsys):
+    """P0-2 回归: 一个文件都没扫到(路径全不存在)时必须以退出码 2 报错, 不得冒充 clean。
+    旧逻辑默认扫描面全是相对路径, 从非项目根运行时静默打 clean = 假阴性安全承诺。"""
+    args = argparse.Namespace(paths=["nonexistent-dir-xyz-123"])
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_leak_check(args)
+    assert ei.value.code == 2
+    out = capsys.readouterr()
+    assert "未扫描到任何文件" in out.err
+    assert "clean" not in out.out  # 绝不能同时打 clean
+
+
+def test_leak_check_scans_real_files_reports_clean(tmp_path, capsys):
+    """有文件可扫且干净 → 正常 clean 退出(退出码 0, 不抛)。与 0 文件路径区分开。"""
+    (tmp_path / "ok.txt").write_text(CLEAN, encoding="utf-8")
+    args = argparse.Namespace(paths=[str(tmp_path)])
+    moa.cmd_leak_check(args)  # 不抛 SystemExit
+    assert "clean" in capsys.readouterr().out
 
 
 def test_warn_sensitive_material_returns_hits_and_prints(capsys):
