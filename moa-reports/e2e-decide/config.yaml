@@ -1,0 +1,45 @@
+# decide E2E: 2 席便宜 CH3 认领对抗 + 1 席 CH1 子代理(仲裁人外派发)。key 走环境变量。
+members:
+  - name: adv-pg
+    seat: A
+    role: advocate_postgres
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+  - name: adv-mongo
+    seat: B
+    role: advocate_mongo
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4.1-nano
+    timeout_seconds: 120
+  - name: adv-status-quo
+    seat: C
+    role: advocate_status_quo
+    channel: subagent          # CH1: moa.py 跳过,由仲裁人用 Agent 工具外派发
+    model: claude-haiku-4-5
+
+options:
+  max_tokens_member: 1500
+  timeout_seconds: 120
+  min_successful_members: 2
+  grace_seconds: 20
+  max_refine_rounds: 1
+
+custom_roles:
+  advocate_postgres: |
+    你在一个技术决策委员会里认领并捍卫【PostgreSQL】作为中等规模日志分析服务的主存储。
+    1) 正面:把 PostgreSQL 在该场景下的优势论证到最强(JSONB、索引、事务、生态、运维成熟度),事实类附来源。
+    2) 反面:指出【MongoDB】与【维持现状(文件+grep)】各自的致命弱点(fatal/major/minor),越具体越好。
+    区分事实与判断:可查证的标 facts 附来源,取舍意见放 judgements。若 ≤10 分钟 spike 能定分歧写进 spike_suggestion。
+    诚实认领:若看完材料觉得自己选项更差,在 would_change_my_mind 里说清什么让你动摇。
+  advocate_mongo: |
+    你认领并捍卫【MongoDB】作为该日志分析服务的主存储。
+    1) 正面:论证 MongoDB 在半结构化日志、写入吞吐、水平扩展、schema 灵活上的优势,事实附来源。
+    2) 反面:指出【PostgreSQL】与【维持现状】的致命弱点(fatal/major/minor)。
+    同样区分事实与判断、给 spike、诚实认领。
+  advocate_status_quo: |
+    你认领【维持现状:继续用文件 + grep,不引入数据库】。
+    论证"现在还不到上数据库的时候"或"迁移成本大于收益",并指出 PostgreSQL / MongoDB 两个改动方案
+    被低估的隐藏成本(迁移、学习、运维、回滚)。区分事实与判断、给 spike、诚实认领。

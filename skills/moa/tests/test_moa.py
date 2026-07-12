@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import types
 import urllib.error
 from pathlib import Path
 
@@ -229,6 +230,66 @@ def test_stats_token_usage_billed_only():
     assert tu["billed_members"] == 2          # 只有 a、b 计费
     assert tu["total_tokens"] == 250          # 140 + 110,订阅席不计入
     assert tu["prompt_tokens"] == 180
+
+
+# ---------- custom 模式: --members/--models(SKILL.md 承诺的入口)----------
+
+def test_build_custom_members_from_models_list():
+    ms = moa.build_custom_members("openai/gpt-5,anthropic/claude-opus-4.8,google/gemini-3.1-pro")
+    assert [m["seat"] for m in ms] == ["A", "B", "C"]
+    assert [m["model"] for m in ms] == ["openai/gpt-5", "anthropic/claude-opus-4.8", "google/gemini-3.1-pro"]
+    assert all(m["channel"] == "api" and m["protocol"] == "openrouter" for m in ms)
+    assert [m["name"] for m in ms] == ["custom-a", "custom-b", "custom-c"]
+
+
+def test_build_custom_members_self_moa_replicate():
+    # 单模型 + --members N = 主动 Self-MoA:复制成 N 席(座位分化角色)
+    ms = moa.build_custom_members("openai/gpt-5", members_n=3)
+    assert len(ms) == 3
+    assert all(m["model"] == "openai/gpt-5" for m in ms)
+    assert [m["seat"] for m in ms] == ["A", "B", "C"]
+
+
+def test_build_custom_members_explicit_dup_is_self_moa():
+    ms = moa.build_custom_members("x,x")           # 显式重复 = Self-MoA
+    assert [m["model"] for m in ms] == ["x", "x"]
+
+
+def test_build_custom_members_matching_count_ok():
+    assert len(moa.build_custom_members("a,b,c", members_n=3)) == 3
+
+
+@pytest.mark.parametrize("csv,n", [("a,b", 3), ("a,b,c", 2)])
+def test_build_custom_members_count_mismatch_errors(csv, n):
+    with pytest.raises(SystemExit):
+        moa.build_custom_members(csv, members_n=n)
+
+
+def test_build_custom_members_over_cap_errors():
+    with pytest.raises(SystemExit):
+        moa.build_custom_members("a,b,c,d,e")      # 上限 4 席
+
+
+@pytest.mark.parametrize("csv", ["", "  ", " , , "])
+def test_build_custom_members_empty_errors(csv):
+    with pytest.raises(SystemExit):
+        moa.build_custom_members(csv)
+
+
+def test_apply_custom_committee_overrides_members():
+    cfg = {"members": [{"name": "orig", "seat": "A"}], "options": {"max_tokens_member": 3000},
+           "custom_roles": {"r": "x"}}
+    args = types.SimpleNamespace(models="a,b", members=None)
+    out = moa.apply_custom_committee(cfg, args)
+    assert [m["model"] for m in out["members"]] == ["a", "b"]   # members 被覆盖
+    assert out["options"] == cfg["options"] and out["custom_roles"] == cfg["custom_roles"]  # 其余保留
+    assert cfg["members"][0]["name"] == "orig"                  # 原 cfg 未被就地改写
+
+
+def test_apply_custom_committee_noop_without_models():
+    cfg = {"members": [{"name": "orig"}], "options": {}}
+    args = types.SimpleNamespace(models=None, members=None)
+    assert moa.apply_custom_committee(cfg, args) is cfg          # 无 --models 原样返回
 
 
 # ---------- Quorum 宽限窗 ----------

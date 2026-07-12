@@ -820,6 +820,42 @@ def resolve_config(path_arg):
     sys.exit(f"config not found: {p}. Copy assets/config.example.yaml to config.yaml and edit.")
 
 
+# ---------- custom 模式: --members/--models 命令行入口 ----------
+
+_CUSTOM_SEATS = "ABCD"  # 委员上限 4(仲裁人 + ≤4 委员,见 requirements)
+
+
+def build_custom_members(models_csv: str, members_n=None) -> list:
+    """把 --models "id1,id2,..." 构建成 custom 委员会(全 CH3 api 席,座位 A/B/C/D 自动分化角色)。
+    重复同一模型 = 主动 Self-MoA;`--members N` + 单模型 = 复制成 N 席 Self-MoA。"""
+    models = [m.strip() for m in models_csv.split(",") if m.strip()]
+    if not models:
+        sys.exit('--models 为空:给逗号分隔的模型 ID,如 --models "openai/gpt-5.6-sol,anthropic/claude-opus-4.8"')
+    if members_n is not None:
+        if members_n < 1:
+            sys.exit(f"--members 需 ≥1,收到 {members_n}")
+        if len(models) == 1:
+            models = models * members_n            # 单模型 + N 席 = 主动 Self-MoA
+        elif len(models) != members_n:
+            sys.exit(f"--members {members_n} 与 --models 的 {len(models)} 个模型数不一致;"
+                     f"要么省略 --members(席数=模型数),要么给单模型 + --members N(Self-MoA)")
+    if len(models) > len(_CUSTOM_SEATS):
+        sys.exit(f"custom 委员数上限 {len(_CUSTOM_SEATS)}(座位 {_CUSTOM_SEATS});收到 {len(models)}")
+    return [{"name": f"custom-{_CUSTOM_SEATS[i].lower()}", "seat": _CUSTOM_SEATS[i],
+             "channel": "api", "protocol": "openrouter", "model": m}
+            for i, m in enumerate(models)]
+
+
+def apply_custom_committee(cfg: dict, args) -> dict:
+    """给了 --models 就用它覆盖 cfg['members'](保留 options/custom_roles);否则原样返回。"""
+    models_csv = getattr(args, "models", None)
+    if not models_csv:
+        return cfg
+    cfg = dict(cfg)
+    cfg["members"] = build_custom_members(models_csv, getattr(args, "members", None))
+    return cfg
+
+
 def cmd_generate(args, cfg):
     material = Path(args.input).read_text(encoding="utf-8")
     warn_sensitive_material(material)  # 外发前敏感信息扫描(不阻断;dry-run 已先给用户看)
@@ -968,6 +1004,13 @@ def main():
         p.add_argument("--topic", default="")
         p.add_argument("--collect-dir", default="moa-reports/run")
         p.add_argument("--member", default=None, help="comma-separated subset for redispatch")
+        _add_custom_flags(p)
+
+    def _add_custom_flags(p):
+        p.add_argument("--members", type=int, default=None,
+                       help="custom 席位数;单模型 + --members N = 主动 Self-MoA")
+        p.add_argument("--models", default=None,
+                       help='custom 委员会: 逗号分隔模型 ID(全 CH3),覆盖 config 的 members')
 
     g = sub.add_parser("generate"); common(g)
     r = sub.add_parser("refine"); common(r); r.add_argument("--round", type=int, default=1)
@@ -982,6 +1025,7 @@ def main():
     d.add_argument("--input", default=None)
     d.add_argument("--topic", default="")
     d.add_argument("--refine-rounds", type=int, default=0, choices=[0, 1, 2])
+    _add_custom_flags(d)
     lc = sub.add_parser("leak-check")
     lc.add_argument("paths", nargs="*",
                     help="要扫描的路径;省略则扫描产物/文档/配置/skill 本体(不含 tests/)")
@@ -991,6 +1035,7 @@ def main():
         cmd_leak_check(args)
         return
     cfg = resolve_config(getattr(args, "config", None))
+    cfg = apply_custom_committee(cfg, args)   # --models 给了就覆盖 members(custom 模式)
     {"generate": cmd_generate, "refine": cmd_refine,
      "stats": cmd_stats, "dry-run": cmd_dry_run}[args.phase](args, cfg)
 

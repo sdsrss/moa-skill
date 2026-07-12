@@ -36,6 +36,13 @@ export OPENROUTER_API_KEY=...                            # 或 OPENAI_API_KEY
 
 # 预演: 看委员构成、通道、代理状态、成本量级,给用户过目
 python skills/moa/scripts/moa.py dry-run --input moa-reports/run/brief.md --refine-rounds 0
+
+# custom 模式(无需改 config): --models 逗号分隔模型 ID,直接组临时委员会(全 CH3)
+python skills/moa/scripts/moa.py dry-run --input moa-reports/run/brief.md \
+  --models "openai/gpt-5.6-sol,anthropic/claude-opus-4.8,google/gemini-3.1-pro-preview"
+# 主动 Self-MoA: 单模型复制成 N 席(座位自动分化角色)
+python skills/moa/scripts/moa.py generate --input moa-reports/run/brief.md \
+  --collect-dir moa-reports/run --members 3 --models "openai/gpt-5.6-sol"
 ```
 
 ## 第 3 步:生成 + 统计

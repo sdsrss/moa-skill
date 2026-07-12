@@ -1,0 +1,25 @@
+# brainstorm E2E: 2 席便宜 CH3,发散人格(座位 A/B 走 DEFAULT_SEAT_ROLE brainstorm)。无精炼轮。
+members:
+  - name: radical-a
+    seat: A                       # radical_innovator
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    temperature_generate: 0.9     # 头脑风暴高温发散
+    timeout_seconds: 120
+  - name: transplant-b
+    seat: B                       # cross_industry_transplanter
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4.1-nano
+    temperature_generate: 0.9
+    timeout_seconds: 120
+
+options:
+  max_tokens_member: 1500
+  timeout_seconds: 120
+  min_successful_members: 2
+  grace_seconds: 20
+  max_refine_rounds: 0
+
+custom_roles: {}
