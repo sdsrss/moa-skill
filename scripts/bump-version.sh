@@ -28,11 +28,19 @@ check() {
     grep -q "status-v$cur" "$r" || { echo "[drift] $r 徽章 ≠ $cur" >&2; fail=1; }
   done
   if [ -f "$MARKET" ]; then
-    # marketplace.json 两处 version 都应 = 插件版本;计非匹配的 version 行数
-    local bad
-    bad=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' "$MARKET" \
-          | grep -vc "\"$cur\"" || true)
-    [ "$bad" -eq 0 ] || { echo "[drift] $MARKET 有 $bad 处 version ≠ $cur" >&2; fail=1; }
+    # 按【字段】精确校验(grep 计数拦不住"二缺一":删掉 metadata.version、plugin 那行仍匹配也会漏判)。
+    # 要求 metadata.version 与每个 plugins[].version 都存在且 = cur。python3 本就是硬依赖。
+    python3 - "$MARKET" "$cur" <<'PY' || fail=1
+import json, sys
+m = json.load(open(sys.argv[1])); v = sys.argv[2]; bad = []
+if m.get("metadata", {}).get("version") != v:
+    bad.append(f"metadata.version={m.get('metadata', {}).get('version')!r}")
+for i, p in enumerate(m.get("plugins", [])):
+    if p.get("version") != v:
+        bad.append(f"plugins[{i}].version={p.get('version')!r}")
+if bad:
+    sys.stderr.write(f"[drift] marketplace.json 应全部 = {v}: {', '.join(bad)}\n"); sys.exit(1)
+PY
   fi
   if [ "$fail" -eq 0 ]; then
     echo "[version] 全部一致 @ $cur ($PLUGIN, $MARKET, $SKILL, ${READMES[*]})"

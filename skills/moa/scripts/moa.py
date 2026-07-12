@@ -591,11 +591,14 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     grace_s 秒宽限;超时者标 skipped_grace(不算失败)。每完成一个即回调 on_done(res) 落盘,
     保证即便落伍者拖尾,collect-dir 也已有法定结果。返回按 members 原序的结果列表。
 
-    止损语义(修 P0-1): 宽限到期必须【立即交还控制权】,不得 join 落伍线程。此前用
+    止损语义(修 P0-1): 宽限到期必须让【本函数立即返回】,不得 join 落伍线程。此前用
     `with ThreadPoolExecutor` 管理,块退出隐式 shutdown(wait=True) 会 join 全部线程,
-    使宽限窗形同虚设(实测 3 席 grace=0.5s 仍 wall=6s)。现改手动管理: 到期
-    shutdown(wait=False),仲裁流程即刻拿到法定结果继续。落伍线程受 member 级 timeout
-    约束在后台自然了结(不无限拖尾),不因此丢失总流程时间。"""
+    使本函数阻塞至最慢席结束(实测 3 席 grace=0.5s 函数仍 6s 才返回)。现改手动管理:
+    到期 shutdown(wait=False),函数即刻返回,仲裁流程拿到法定结果继续、collect-dir 已有
+    法定产物。范围限定: 界定的是【函数返回延迟】,不是进程总 wall-clock——落伍工作线程
+    仍在后台跑,concurrent.futures 的 atexit 会在解释器退出时 join 它们,故 `generate`
+    进程收尾可能再等落伍席一小段(上界 = member 级 timeout,不无限拖尾)。要连进程退出也
+    界定需改 daemon 线程,但那会硬杀在途 HTTP,得不偿失,故不做。"""
     results = {}
     ex = ThreadPoolExecutor(max_workers=max(1, len(members)))
     abandoned = False
@@ -1059,6 +1062,15 @@ def validate_config(cfg):
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
         sys.exit(f"[config] member name 重复: {', '.join(dups)}——产物按 name 落盘会互相覆盖,请改唯一名")
+    # 文件名规范化(_safe_name 把 / : 空格等映射为 _)后的碰撞也会互相覆盖:原始名唯一 ≠ 落盘名唯一。
+    # 否则两个相异合法名(如 'a/b' 与 'a_b')同写 member_a_b.json,后者覆盖前者→该席静默从仲裁/stats 消失。
+    safe_seen = {}
+    for n in names:
+        s = _safe_name(n)
+        if s in safe_seen:
+            sys.exit(f"[config] member name {n!r} 与 {safe_seen[s]!r} 经文件名规范化后同为 "
+                     f"member_{s}.json,会互相覆盖;请改用规范化后仍相异的名字")
+        safe_seen[s] = n
     if not isinstance(cfg.get("options"), dict):
         sys.exit("[config] 缺 options 块(max_tokens_member/timeout_seconds/min_successful_members 等);"
                  "参照 assets/config.example.yaml")

@@ -7,7 +7,7 @@
 原理基于 **Mixture-of-Agents（MoA）**：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术 / 事实检索）不要用。
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.3.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-125%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.3.1-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-126%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -216,7 +216,7 @@ key 只从环境变量读取——不落盘、不进日志 / 报告；`leak-chec
 ## 开发
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 125 项(行为测试 + 文档一致性校验)，无网络
+python -m pytest skills/moa/tests/ -q      # 126 项(行为测试 + 文档一致性校验)，无网络
 python skills/moa/scripts/moa.py leak-check # 密钥泄漏静态自查：命中即非零退出（预览脱敏）
 ```
 

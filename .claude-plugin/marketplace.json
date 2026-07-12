@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "MoA — multi-model committee (Mixture-of-Agents) skill for Claude Code.",
-    "version": "1.3.0"
+    "version": "1.3.1"
   },
   "plugins": [
     {
       "name": "moa",
       "source": "./",
       "description": "Multi-model committee: your agent chairs up to 4 heterogeneous LLM members that blind-review, decide, and brainstorm in parallel — independent generation → structured interaction → evidence-driven convergence.",
-      "version": "1.3.0",
+      "version": "1.3.1",
       "category": "development"
     }
   ]

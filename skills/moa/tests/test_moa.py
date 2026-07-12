@@ -198,6 +198,7 @@ def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     {"members": [{"channel": "api"}], "options": {}},         # member 缺 name
     {"members": [{"name": "x", "channel": "bogus"}], "options": {}},  # channel 非法
     {"members": [{"name": "x"}, {"name": "x"}], "options": {}},       # name 重复(会互相覆盖)
+    {"members": [{"name": "a/b"}, {"name": "a_b"}], "options": {}},   # 规范化后碰撞(→同一文件名)
 ])
 def test_validate_config_rejects_broken(cfg):
     with pytest.raises(SystemExit):

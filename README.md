@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.3.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-125%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.3.1-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-126%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -201,7 +201,7 @@ Per the MoA paper, aggregators benefit from full context while proposers don't �
 ## Development
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 125 cases (behavior + doc-consistency fixtures), no network
+python -m pytest skills/moa/tests/ -q      # 126 cases (behavior + doc-consistency fixtures), no network
 python skills/moa/scripts/moa.py leak-check # static secret-leak self-check: non-zero exit on hit (preview redacted)
 ```
 
