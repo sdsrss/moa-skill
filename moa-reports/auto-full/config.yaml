@@ -1,0 +1,53 @@
+# auto 顶配实跑: 决策/L3/仲裁 → 4 席全异构,三通道,认领对抗。
+# 模型按 2026-07-12 该 key 实测【可用最强】落地(grok/deepseek list-only-404,故 D 用 gpt-5;
+# 仅 OpenAI/Google/Anthropic 三族可服务,见 assets/config.example.yaml slug 核对备忘)。
+members:
+  - name: adv-inhouse
+    seat: A                              # 逻辑/方案权衡 → 认领【自研】
+    role: advocate_inhouse
+    channel: cli                         # CH2: codex 默认模型(GPT-5 级)
+    protocol: codex
+    # 不设 model: ChatGPT 账号的 codex 不支持显式 -m gpt-5-codex(400 not supported),用 codex 默认
+    timeout_seconds: 240
+  - name: adv-kong
+    seat: B                              # 工程实现 → 认领【Kong】
+    role: advocate_kong
+    channel: subagent                    # CH1: opus-4.8 子代理(仲裁人外派发)
+    model: claude-opus-4.8
+  - name: adv-envoy
+    seat: C                              # 事实核查 → 认领【Envoy】
+    role: advocate_envoy
+    channel: api                         # CH3: openrouter
+    protocol: openrouter
+    model: google/gemini-3.1-pro-preview
+    timeout_seconds: 240                 # 推理/较慢,放宽 + 足够 max_tokens 防空壳
+  - name: redteam-d
+    seat: D                              # 反方红队 → 攻击三方 + 事实核查
+    role: redteam_factcheck
+    channel: api                         # CH3: openrouter
+    protocol: openrouter
+    model: openai/gpt-5                   # grok 不可用,用 gpt-5 作第 4 席(OpenAI 第二变体)
+    timeout_seconds: 240
+
+options:
+  max_tokens_member: 8000                # gpt-5 推理很重:3000 下 190s 仍返空壳,加到 8000 给足推理+输出额度
+  timeout_seconds: 240
+  min_successful_members: 2
+  grace_seconds: 40                      # 顶配/推理较慢,放宽宽限窗防落伍席被误杀
+  max_refine_rounds: 1
+
+custom_roles:
+  advocate_inhouse: |
+    你在技术决策委员会认领并捍卫【继续自研(Rust/Go 重写)】作为下一代 API 网关。
+    正面:把自研在本场景(完全自控、无锁定、精确贴合鉴权/限流/灰度需求)论证到最强,事实附来源。
+    反面:指出【Kong】【Envoy】各自被低估的隐藏成本(fatal/major/minor)。区分 facts(附来源)/judgements,给 ≤1 天 spike,诚实认领。
+  advocate_kong: |
+    你认领并捍卫【Kong】作为下一代 API 网关。正面:插件生态、企业支持、鉴权/限流/灰度开箱、迁移平滑度。
+    反面:指出【自研】【Envoy】的致命弱点。区分 facts/judgements,给 spike,诚实认领。
+  advocate_envoy: |
+    你认领并捍卫【Envoy】作为下一代 API 网关。正面:xDS 动态配置、性能、CNCF 生态、与未来 service mesh 的一致性。
+    反面:指出【自研】【Kong】的致命弱点。区分 facts/judgements,给 spike,诚实认领。
+  redteam_factcheck: |
+    你是反方红队 + 事实核查员,不认领任何选项。任务:攻击三个选项各自最强论据里最可疑的事实断言,
+    要求可查证来源;指出三方共同忽略的约束(团队无专职 SRE、90 天不停服迁移、4 万 RPS)。
+    把"听起来对但没证据"的断言逐条标出。区分 facts/judgements,给能证伪关键分歧的 ≤1 天 spike。

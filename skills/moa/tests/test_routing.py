@@ -109,3 +109,30 @@ def test_composite_intent_is_registered_boundary():
     # 只挑到单一场景(此处命中 brainstorm),与"应先 review"的意图分歧——如实登记为边界。
     # 真实语义路由会识别复合并拆两次;此断言只锁"启发式退化成单场景"这一已知近似事实。
     assert classify_scenario(KNOWN_BOUNDARY_COMPOSITE) in ("review", "brainstorm")
+
+
+# ---------- 开会讨论 L3 选路门(routing.md §6阶段5;三条硬门) ----------
+
+def refine_stage_for(difficulty, deep_dispute, user_wants_debate, scenario="decide"):
+    """auto 精炼阶段选路的近似。开会讨论 = L3 + 根本分歧未化解 + 用户明确要求,三条全满足;
+    否则默认:决策→交叉审查 / 评审→匿名互评。"""
+    if difficulty == "L3" and deep_dispute and user_wants_debate:
+        return "discuss"
+    return "cross_exam" if scenario == "decide" else "peer_review"
+
+
+def test_discuss_selected_only_when_all_three_gates_met():
+    assert refine_stage_for("L3", deep_dispute=True, user_wants_debate=True) == "discuss"
+
+
+def test_discuss_not_selected_without_explicit_user_request():
+    # 第 3 条硬门:分歧再大,用户没显式要 → 不擅自升级(默认交叉审查)
+    assert refine_stage_for("L3", deep_dispute=True, user_wants_debate=False) == "cross_exam"
+
+
+def test_discuss_not_selected_below_L3_or_without_dispute():
+    assert refine_stage_for("L2", deep_dispute=True, user_wants_debate=True) == "cross_exam"   # 非 L3
+    assert refine_stage_for("L3", deep_dispute=False, user_wants_debate=True) == "cross_exam"  # 无根本分歧
+    assert refine_stage_for("L1", deep_dispute=True, user_wants_debate=True) == "cross_exam"
+    # 评审场景默认精炼是匿名互评
+    assert refine_stage_for("L2", True, True, scenario="review") == "peer_review"

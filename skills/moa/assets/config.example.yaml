@@ -8,8 +8,23 @@
 #            moa.py 遇到此通道会跳过(留给仲裁人)。
 #
 # fallback: 通道降级链,按序尝试。仲裁人永不降级——fallback 只降委员席位。
-# 代理: 脚本自动读取 http_proxy/https_proxy/no_proxy,检测到代理时 api 调用优先走代理。
+# 代理(重要): LLM 连接必须走代理。脚本自动读取 http_proxy/https_proxy/no_proxy,对非 no_proxy
+#   主机(如 openrouter.ai)构建 ProxyHandler,api 调用优先走代理;启动会打印 "[proxy] detected env proxy"。
+#   自查: python3 -c "import sys;sys.path.insert(0,'skills/moa/scripts');import moa;print(moa.PROXIES, moa._bypass_proxy('openrouter.ai'))"
+#   —— bypass 应为 False(=走代理)。CH2 codex 与 CH1 子代理走各自进程,同样继承 shell 的 *_proxy 环境变量。
+#   排障提示: 过代理后仍 HTTP 404 = 该 key 真不服务此模型(list-only),不是代理问题(gpt-5 同代理可通即为证)。
 # 默认为 2026-07 各家顶级模型(异构四家族 A/B/C/D)。模型 ID 迭代快,正式运行前对照核对一次。
+#
+# ── slug 核对备忘(2026-07-12 对某 OPENROUTER key 实测,不同 key 供给不同,自行复核)──
+# 查全量可用 slug:  curl -s https://openrouter.ai/api/v1/models -H "Authorization: Bearer $OPENROUTER_API_KEY" | jq -r '.data[].id'
+#   ★ 推理模型陷阱: gpt-5 / gpt-5-pro / gemini-3.1-pro-preview 在 max_tokens 很小(如 5~30)时
+#     推理会吃光额度、content 返空壳 —— 这是【假阴性】,不是模型不可用。核对/正式跑都要给足
+#     max_tokens(≥800;options.max_tokens_member=3000 足够)。别再拿"返空"当"不存在"。
+#   ✔ 实测可服务: openai/gpt-5, openai/gpt-5-codex, google/gemini-3.1-pro-preview,
+#     google/gemini-2.5-pro, anthropic/claude-opus-4.8
+#   ✘ 在清单里但端点 404(list-only,不可用): x-ai/grok-4.x 全系, deepseek/deepseek-v3.2
+#   ✘ 纯不存在的 slug(别再猜): openai/gpt-5.6-sol(应为 openai/gpt-5 或 gpt-5-codex)
+#   → 该 key 实际只服务 OpenAI/Google/Anthropic 三族;要四族异构需换有 x-ai/deepseek 供给的 key。
 
 members:
   - name: reasoning-a          # A 席: 逻辑推理/方案权衡
