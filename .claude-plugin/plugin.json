@@ -1,7 +1,7 @@
 {
   "name": "moa",
-  "version": "1.1.1",
-  "description": "多模型委员会:当前 agent(仲裁人)与最多4个异构模型委员并行独立盲审 → 结构化互动 → 证据驱动收敛,对评审/决策/推荐/头脑风暴等判断类任务产出比单一模型更可靠的结论。",
+  "version": "1.1.2",
+  "description": "Multi-model committee (Mixture-of-Agents) for Claude Code: your agent chairs up to 4 heterogeneous LLM members that blind-review, decide, and brainstorm in parallel — independent generation → structured interaction → evidence-driven convergence — for conclusions more reliable than any single model.",
   "author": {
     "name": "sds.rs",
     "email": "jack.sds5889@gmail.com"
