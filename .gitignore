@@ -1,17 +1,42 @@
-# 本地工具状态 / 生成物(不入库,也不随插件分发)
+# ── 项目文档与本机指令(不随仓库发布)──────────────────
+docs/
+CLAUDE.md
+CLAUDE.local.md
+
+# ── 本地工具状态 / 缓存 / 生成物 ───────────────────────
 .code-graph/
 .claude/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# 运行产物:逐委员意见与统计可再生,不入库;
-# 但保留 COST-NOTE.md / brief.md / config.yaml 作为可复现的证据样例(见 moa-reports/cost-m4/)。
+# ── 密钥 / 环境 / 本地配置 ─────────────────────────────
+.env
+.env.*
+!.env.example
+/config.yaml
+
+# ── Python 虚拟环境 / 打包产物 ─────────────────────────
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.python-version
+
+# ── 编辑器 / 操作系统 ─────────────────────────────────
+.vscode/
+.idea/
+*.sw[op]
+.DS_Store
+Thumbs.db
+*.log
+node_modules/
+
+# ── 运行产物:逐委员意见与统计可再生,不入库 ───────────
+# 保留 COST-NOTE.md / brief.md / config.yaml 作可复现证据样例(见 moa-reports/cost-m4/)。
 moa-reports/**/member_*.json
 moa-reports/**/stats*.json
-
-# 第三方参考项目源码:仅本地研究用,不随本仓 MIT 发布(版权归各原作者;
-# 采纳分析见 docs/reference-adoption.md)。
-docs/moa参考插件1/
-docs/moa参考插件2/
-docs/moa参考插件3/

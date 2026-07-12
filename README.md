@@ -4,7 +4,7 @@
 
 原理基于 Mixture-of-Agents：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术/事实检索）不要用。
 
-> 状态：**M1–M3 已实现并经真实 API 验证 · M4 收尾中**。设计全文见 [`docs/`](docs/)（requirements / design / development-plan / reference-adoption）。
+> 状态：**v1.0（M1–M4 已实现并经真实 API 验证）**。需求/设计/计划等开发文档为仓库内部材料，未随发布；角色契约与硬规则见 [`skills/moa/references/`](skills/moa/references/)。
 
 ## 三个通道
 
@@ -123,12 +123,11 @@ MIT，见 [LICENSE](LICENSE)。
 
 | 随插件加载（运行时表面） | 仅开发/记录，不被加载 |
 |---|---|
-| `.claude-plugin/plugin.json` | `docs/`（设计文档 + 大图，仅 SKILL.md 里一句叙述指针引用，非加载依赖） |
+| `.claude-plugin/plugin.json` | `docs/`、`CLAUDE.md`（**已 gitignore：仅本地开发材料，不入库、不发布**） |
 | `skills/moa/`（SKILL.md / references / scripts / assets / tests） | `moa-reports/`（**运行输出目录**，相对用户 cwd 生成，非仓内容） |
-| | `README.md` · `CLAUDE.md` · `.git/` · `.code-graph/` · `.claude/`（本地状态） |
+| | `README.md`（在仓，不被加载）· `.git/` · `.code-graph/` · `.claude/`（本地状态） |
 
-- skill 运行时对仓根 `docs/` 与 `moa-reports/` **零加载依赖**（已核实：SKILL.md 中二者仅为叙述指针/输出路径约定）。故 `docs/` 的大图不会随插件被 Claude 读取。
-- `.gitignore` 排除可再生产物（`__pycache__` / `.pytest_cache` / `.code-graph/` / `.claude/` / `moa-reports/**/member_*.json` / `stats*.json`），保留 `moa-reports/cost-m4/` 的 `COST-NOTE.md`/`brief.md`/`config.yaml` 作可复现证据样例。
-- 若要进一步瘦身分发 clone，可把 `docs/` 大图（两张 ~200KB PNG）移出仓或转为外链——但它们本就不进插件运行时，属可选优化。
+- skill 运行时对 `docs/` 与 `moa-reports/` **零加载依赖**，且 `docs/`、`CLAUDE.md` 已由 `.gitignore` 排除出仓库——设计/需求/计划文档留在维护者本地。
+- `.gitignore` 另排除可再生产物与本地配置（`__pycache__` / `.pytest_cache` / 各 lint 缓存 / `.venv/` / `.env*` / 根 `config.yaml` / `moa-reports/**/member_*.json` / `stats*.json`），保留 `moa-reports/cost-m4/` 的 `COST-NOTE.md`/`brief.md`/`config.yaml` 作可复现证据样例。
 
 安装：作为插件被识别后按插件装；或不装插件、直接把 `skills/moa/` 拷到 `~/.claude/skills/moa/`。
