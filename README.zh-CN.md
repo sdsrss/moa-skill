@@ -7,7 +7,7 @@
 原理基于 **Mixture-of-Agents（MoA）**：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术 / 事实检索）不要用。
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.3.1-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-126%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.3.2-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-126%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---

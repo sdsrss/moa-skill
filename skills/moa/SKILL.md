@@ -1,13 +1,13 @@
 ---
 name: moa
-description: MoA 多模型委员会——把当前 agent(仲裁人)与最多4个异构模型委员组成"五模型委员会",对高价值判断类任务(评审/决策/推荐/头脑风暴,及审核/审查/分析/测试问题的二次确认)做"并行独立生成→结构化互动→证据驱动收敛",产出比单一模型更可靠的结论。触发词:moa模式/多人评审/多人委员会/委员会/多模型/第二意见/交叉验证/对上面的分析做出建议/对上面的总结做出建议/moa/council。主 agent 遇到多方案难取舍、对自身结论置信度低、或反复失败需要外部视角时,也应主动调用本技能。简单问答与可机械验证的客观问题(算术/事实检索)不要用。
+description: MoA multi-model committee — you (the arbiter) chair up to 4 heterogeneous LLM members that blind-review, decide, or brainstorm in parallel, then converge on evidence, for conclusions more reliable than any single model. Usage — /moa <material to review, decide, or brainstorm>. Use it for review, audit, decisions, recommendations, brainstorming, or a second-opinion double-check — or when the main agent hits hard trade-offs, low confidence, or repeated failure and needs an outside view; skip simple Q&A and mechanically-verifiable facts (arithmetic, fact lookup). 触发词 moa模式/多人评审/多人委员会/委员会/多模型/第二意见/交叉验证/对上面的分析做出建议/对上面的总结做出建议/moa/council。
 ---
 
 # MoA：多模型委员会
 
 把多个异构大模型组成"委员会":委员互相隔离、各领角色独立盲审,当前 agent 作为仲裁人按硬规则收敛。原理基于 Mixture-of-Agents——不同模型盲点不同,独立盲审 + 结构化聚合能突破单模型上限。角色契约、收敛硬规则与简报模板见本目录 `references/`。
 
-> **实现状态:v1.3.1**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex / CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
+> **实现状态:v1.3.2**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex / CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
 
 ## 三种调用模式
 
