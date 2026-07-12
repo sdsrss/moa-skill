@@ -109,8 +109,8 @@ def test_conformity_alert_flags_change_without_new_argument():
     assert a_pair["discussion_final"] == "下迭代" and a_pair["blind_final"] == "必须修"
     b_pair = next(p for p in st["blind_vote_drift_pairs"] if p["seat"] == "B")
     assert b_pair["blind_final"] is None            # B 无盲投
-    # token: 只累计计费席(usage 非空),CH1/None 不计
-    assert st["token_usage"]["total_tokens"] == 27 and st["token_usage"]["billed_members"] == 3
+    # token: 只累计计费回合(usage 非空),CH1/None 不计。讨论按回合计费,故键为 billed_calls(C6)
+    assert st["token_usage"]["total_tokens"] == 27 and st["token_usage"]["billed_calls"] == 3
 
 
 def test_argument_driven_change_is_not_conformity():

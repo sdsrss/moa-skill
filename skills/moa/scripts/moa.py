@@ -175,9 +175,12 @@ def _bypass_proxy(host: str) -> bool:
     if host in ("localhost", "127.0.0.1", "::1"):
         return True
     no = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+    entries = [x.strip() for x in no.split(",") if x.strip()]
+    if "*" in entries:            # NO_PROXY=* → 绕过所有主机(修 C4)
+        return True
     return any(
         host == h.lstrip(".") or host.endswith("." + h.lstrip("."))
-        for h in (x.strip() for x in no.split(",")) if h
+        for h in entries
     )
 
 
@@ -583,12 +586,6 @@ DEFAULT_SEAT_ROLE = {
 
 # ---------- 并行执行 + 产物落盘 ----------
 
-def parallel_members(members, fn, max_workers=None):
-    mw = max_workers or max(1, len(members))
-    with ThreadPoolExecutor(max_workers=mw) as ex:
-        return list(ex.map(fn, members))
-
-
 def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     """Quorum 宽限窗(design.md §10): 存活委员数达 quorum_target 后,给仍在跑的落伍者
     grace_s 秒宽限;超时者标 skipped_grace(不算失败)。每完成一个即回调 on_done(res) 落盘,
@@ -649,9 +646,17 @@ def _skipped_grace(member):
     }
 
 
+def _safe_name(name: str) -> str:
+    """把 member name 收敛成安全文件名片段(修 C2): 只留字母/数字/._-,其余(含 / 和 ..)
+    换成 _,防路径穿越把产物写出 collect-dir。config 由用户自控,风险低,但门要堵。"""
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", str(name))
+    s = s.strip(".") or "member"        # 全点/空 → 兜底,避免 '' 或 '..'
+    return s
+
+
 def write_member(collect_dir: Path, res: dict, round_no: int = 0):
     suffix = f".r{round_no}" if round_no else ""
-    p = collect_dir / f"member_{res['name']}{suffix}.json"
+    p = collect_dir / f"member_{_safe_name(res['name'])}{suffix}.json"
     p.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     return p
 
@@ -875,8 +880,10 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
         "early_stop_suggested": bool(pseudo_rounds and pseudo_rounds[-1] == rounds[-1]) if rounds else False,
         "blind_vote_drift_pairs": drift_pairs,
         "dissent_preserved": dissent,
+        # 讨论按回合计费(同席多轮各计一次),故用 billed_calls 而非 billed_members(修 C6:
+        # review/refine 的 billed_members 是每席一次=席位数;讨论一席多回合,计的是计费调用次数)。
         "token_usage": {**_merge_usage(*usages),
-                        "billed_members": sum(1 for u in usages if u)},
+                        "billed_calls": sum(1 for u in usages if u)},
     }
 
 
@@ -1177,6 +1184,7 @@ def cmd_refine(args, cfg):
     if args.mode == "brainstorm":
         sys.exit("[refine] brainstorm 模式无精炼轮(策展直接在收敛阶段)。")
     material = Path(args.input).read_text(encoding="utf-8")
+    warn_sensitive_material(material)  # --input 可换文件,精炼轮同样外发,补敏感扫描(C5)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
     members = _select_members(cfg, args.member)
@@ -1237,6 +1245,8 @@ def cmd_discuss_turn(args, cfg):
     """开会讨论单回合(§6 阶段5): 一位委员看见此前发言、发言、追加到 discussion.jsonl。
     CH2/CH3 席由本命令直接派发;CH1 席由仲裁人用 discuss-prompt 取词外派发,再 --inject 回填。"""
     material = Path(args.input).read_text(encoding="utf-8")
+    if not args.inject:                # 注入回填不外发;真实派发回合补敏感扫描(C5)
+        warn_sensitive_material(material)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
     m = _one_member(cfg, args.member, "discuss-turn")

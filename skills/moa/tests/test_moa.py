@@ -255,6 +255,76 @@ def test_explicit_temperature_overrides_mode_default(monkeypatch):
     assert seen["temp"] == 0.1          # member 显式设置优先于模式默认
 
 
+# ---------- C2: write_member 文件名 sanitize(防路径穿越) ----------
+
+def test_safe_name_strips_traversal():
+    assert "/" not in moa._safe_name("../../etc/passwd")
+    assert ".." not in moa._safe_name("../evil")
+    assert "/" not in moa._safe_name("a/b/c")
+
+
+def test_safe_name_preserves_normal_names():
+    assert moa._safe_name("skeptic-a") == "skeptic-a"
+    assert moa._safe_name("custom_b.1") == "custom_b.1"
+
+
+def test_write_member_stays_inside_collect_dir(tmp_path):
+    p = moa.write_member(tmp_path, {"name": "../evil", "parsed": {"ok": 1}})
+    assert p.parent == tmp_path                 # 没被 ../ 写出目录
+    assert ".." not in p.name and "/" not in p.name
+    assert p.exists()
+
+
+# ---------- C4: _bypass_proxy 支持 NO_PROXY=* 通配 ----------
+
+def test_bypass_proxy_wildcard(monkeypatch):
+    monkeypatch.setenv("no_proxy", "*")         # 小写键;代码优先读 no_proxy
+    assert moa._bypass_proxy("openrouter.ai") is True
+    assert moa._bypass_proxy("any.host.example") is True
+
+
+# ---------- 入口层: discuss-turn --inject 非法 JSON → 退出(不静默污染 transcript) ----------
+
+def test_discuss_turn_bad_inject_json_exits(tmp_path):
+    brief = tmp_path / "b.md"; brief.write_text("brief", encoding="utf-8")
+    bad = tmp_path / "bad.json"; bad.write_text("definitely not json", encoding="utf-8")
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "subagent"}],
+           "options": {"timeout_seconds": 60, "max_tokens_member": 100}}
+    args = types.SimpleNamespace(input=str(brief), member="a", inject=str(bad),
+                                 collect_dir=str(tmp_path / "out"), mode="decide", round=1)
+    with pytest.raises(SystemExit):
+        moa.cmd_discuss_turn(args, cfg)
+
+
+# ---------- 入口层: _select_members --member 子集过滤 ----------
+
+def test_select_members_filters_by_name():
+    cfg = {"members": [{"name": "a"}, {"name": "b"}, {"name": "c"}]}
+    assert [m["name"] for m in moa._select_members(cfg, "a,c")] == ["a", "c"]
+    assert len(moa._select_members(cfg, None)) == 3          # 无过滤 → 全体
+
+
+def test_select_members_no_match_exits():
+    with pytest.raises(SystemExit):
+        moa._select_members({"members": [{"name": "a"}]}, "zzz")
+
+
+# ---------- 入口层: cmd_generate 成功席 < min_ok → 中止(顾问不足不配称委员会) ----------
+
+def test_cmd_generate_aborts_below_min_ok(tmp_path, monkeypatch):
+    brief = tmp_path / "b.md"; brief.write_text("brief", encoding="utf-8")
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "m"},
+                       {"name": "b", "seat": "B", "channel": "api", "model": "m"}],
+           "options": {"timeout_seconds": 60, "max_tokens_member": 100,
+                       "min_successful_members": 2, "grace_seconds": 0}}
+    monkeypatch.setattr(moa, "run_member_generate",
+                        lambda m, *a: moa._fail(m, "r", "boom", "transient"))  # 全挂
+    args = types.SimpleNamespace(input=str(brief), member=None,
+                                 collect_dir=str(tmp_path / "out"), mode="review", topic="")
+    with pytest.raises(SystemExit):
+        moa.cmd_generate(args, cfg)
+
+
 # ---------- 统计块: 按模式分支 + 分母只计成功 + degraded ----------
 
 def _res(name, seat, parsed, err_class=None):

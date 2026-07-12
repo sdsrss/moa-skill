@@ -7,7 +7,7 @@ description: MoA 多模型委员会——把当前 agent(仲裁人)与最多4个
 
 把多个异构大模型组成"委员会":委员互相隔离、各领角色独立盲审,当前 agent 作为仲裁人按硬规则收敛。原理基于 Mixture-of-Agents——不同模型盲点不同,独立盲审 + 结构化聚合能突破单模型上限。角色契约、收敛硬规则与简报模板见本目录 `references/`。
 
-> **实现状态:v1.1.7**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex / CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
+> **实现状态:v1.2.0**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex / CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
 
 ## 三种调用模式
 
@@ -53,7 +53,7 @@ python skills/moa/scripts/moa.py generate --mode review \
 python skills/moa/scripts/moa.py stats --mode review --collect-dir moa-reports/run
 ```
 
-`moa.py` 只跑 `channel: api`(CH3)与 `channel: cli`(CH2,codex)席位;`channel: subagent`(CH1)席位它会跳过并提示。
+`moa.py` 只跑 `channel: api`(CH3)与 `channel: cli`(CH2,codex)席位;**纯** `channel: subagent`(CH1、无 api/cli fallback)席位它会跳过并提示。注意:若某 subagent 席挂了 api/cli fallback,moa.py 会判它可派发并实走那条 fallback(api=计费),而非留给你免费派发——订阅席不要挂 api fallback(dry-run 会对此打 ⚠)。
 
 **CH1 子代理席位由你(仲裁人)脚本外派发**,与 `moa.py` 并行:
 1. 先后台启动 `moa.py generate`(CH2/CH3 席位);

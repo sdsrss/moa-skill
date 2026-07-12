@@ -14,10 +14,11 @@
 | 轮次 | 每轮一次性并行 | 多轮,每轮逐席顺序 |
 | 编排 | `moa.py refine` 一条命令 | **仲裁人逐回合编排**,`moa.py` 提供 per-turn 助手 |
 
-## 三重反从众对冲(全部内置)
-1. **发言顺序轮转**:每轮轮转发言序(第 1 轮 A→B→C,第 2 轮 B→C→A…),消除固定锚点/固定跟随者。
-2. **每回合强制标注**:`position_changed` + `changed_by_new_argument` + `new_argument`。**无新论据却改立场 = 从众**,被 `discuss-stats` 机械计入 `conformity_alerts`。整轮全员 `new_argument` 空 = 假讨论(`pseudo_discussion_rounds`),末轮假讨论 → `early_stop_suggested`。
-3. **收尾盲投**:讨论结束后每席**不看 transcript**独立复述最终立场(`discuss-blindvote`)。`blind_vote_drift_pairs` 给出(讨论终态 vs 盲投终态)配对——两者不一致 = 讨论诱发漂移的证据,交仲裁人判读。
+## 三重反从众对冲
+> 第 1 条靠**你(仲裁人)**按轮次调 `--member` 发言序实现,`moa.py` 不强制、不校验;第 2、3 条由 `discuss-stats` 机械落实(`conformity_alerts` / `blind_vote_drift_pairs`)。别漏排轮转。
+1. **发言顺序轮转**(仲裁人手工):每轮轮转发言序(第 1 轮 A→B→C,第 2 轮 B→C→A…),消除固定锚点/固定跟随者。
+2. **每回合强制标注**(脚本机械):`position_changed` + `changed_by_new_argument` + `new_argument`。**无新论据却改立场 = 从众**,被 `discuss-stats` 机械计入 `conformity_alerts`。整轮全员 `new_argument` 空 = 假讨论(`pseudo_discussion_rounds`),末轮假讨论 → `early_stop_suggested`。
+3. **收尾盲投**(脚本机械):讨论结束后每席**不看 transcript**独立复述最终立场(`discuss-blindvote`)。`blind_vote_drift_pairs` 给出(讨论终态 vs 盲投终态)配对——两者不一致 = 讨论诱发漂移的证据,交仲裁人判读。
 
 ## 编排步骤(仲裁人执行)
 

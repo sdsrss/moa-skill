@@ -9,12 +9,18 @@ call_model 注入,重试/退避/分类/修复/中止全走真代码路径):
 「全挂→中止」另有一条真实 API E2E(坏模型 ID → 全 404 → abort),见 moa-reports/e2e-fault/。
 """
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import moa  # noqa: E402
+
+
+def _proc(rc, out=b"", err=b""):
+    """伪 subprocess.CompletedProcess,喂给 call_cli_codex 的分类分支测试。"""
+    return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
 
 # ---------- 行为 1: 瞬态/超时 → 重试;永久错误 → 立即抛 ----------
@@ -121,3 +127,57 @@ def test_all_members_fail_yields_zero_ok():
     ok = [r for r in results if r["parsed"]]
     assert len(ok) == 0                       # 全挂 → 0 成功;cmd_generate 据此 sys.exit 中止
     assert all(r["err_class"] == "transient" for r in results)
+
+
+# ---------- CH2 codex CLI 通道:错误分类分支(补测,cli 路径此前无单测) ----------
+
+def test_cli_codex_missing_binary_is_permanent(monkeypatch):
+    monkeypatch.setattr(moa, "_which", lambda e: None)          # codex 不在 PATH
+    with pytest.raises(moa.PermanentError) as ei:
+        moa.call_cli_codex({"codex_bin": "nope"}, "s", "u", 5)
+    assert ei.value.err_class == "startup"
+
+
+def test_cli_codex_timeout_is_transient(monkeypatch):
+    monkeypatch.setattr(moa, "_which", lambda e: "/usr/bin/codex")
+
+    def boom(*a, **k):
+        raise moa.subprocess.TimeoutExpired(cmd="codex", timeout=1)
+
+    monkeypatch.setattr(moa.subprocess, "run", boom)
+    with pytest.raises(moa.TransientError) as ei:
+        moa.call_cli_codex({"codex_bin": "codex"}, "s", "u", 1)
+    assert ei.value.err_class == "timeout"
+
+
+def test_cli_codex_auth_error_is_permanent(monkeypatch):
+    monkeypatch.setattr(moa, "_which", lambda e: "/usr/bin/codex")
+    monkeypatch.setattr(moa.subprocess, "run",
+                        lambda *a, **k: _proc(1, err=b"401 unauthorized: please login"))
+    with pytest.raises(moa.PermanentError) as ei:
+        moa.call_cli_codex({}, "s", "u", 5)
+    assert ei.value.err_class == "auth"       # stderr 含 login/auth/401 → 永久,不重试
+
+
+def test_cli_codex_generic_nonzero_is_transient(monkeypatch):
+    monkeypatch.setattr(moa, "_which", lambda e: "/usr/bin/codex")
+    monkeypatch.setattr(moa.subprocess, "run",
+                        lambda *a, **k: _proc(2, err=b"transient upstream hiccup"))
+    with pytest.raises(moa.TransientError):    # 非 auth 的非零退出 → 瞬态,可降级/重试
+        moa.call_cli_codex({}, "s", "u", 5)
+
+
+def test_cli_codex_empty_output_is_transient(monkeypatch):
+    monkeypatch.setattr(moa, "_which", lambda e: "/usr/bin/codex")
+    monkeypatch.setattr(moa.subprocess, "run", lambda *a, **k: _proc(0, out=b"   "))
+    with pytest.raises(moa.TransientError) as ei:
+        moa.call_cli_codex({}, "s", "u", 5)
+    assert ei.value.err_class == "empty"      # 配额耗尽会产空壳 → 瞬态
+
+
+def test_cli_codex_success_parses_stdout(monkeypatch):
+    monkeypatch.setattr(moa, "_which", lambda e: "/usr/bin/codex")
+    monkeypatch.setattr(moa.subprocess, "run",
+                        lambda *a, **k: _proc(0, out=b'{"verdict":"pass"}'))
+    out, parsed = moa.call_cli_codex({}, "s", "u", 5)   # last.txt 不存在 → 回退读 stdout
+    assert parsed == {"verdict": "pass"}
