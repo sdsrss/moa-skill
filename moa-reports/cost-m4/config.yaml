@@ -1,0 +1,23 @@
+# M4 成本实测专用配置(2 席异构 CH3,便宜模型)。key 走环境变量。
+members:
+  - name: mini-a
+    seat: A
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+  - name: nano-c
+    seat: C
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4.1-nano
+    timeout_seconds: 120
+
+options:
+  max_tokens_member: 1200
+  timeout_seconds: 120
+  min_successful_members: 2
+  grace_seconds: 20
+  max_refine_rounds: 1
+
+custom_roles: {}

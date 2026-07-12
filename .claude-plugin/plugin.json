@@ -1,0 +1,20 @@
+{
+  "name": "moa",
+  "version": "1.0.0",
+  "description": "多模型委员会:当前 agent(仲裁人)与最多4个异构模型委员并行独立盲审 → 结构化互动 → 证据驱动收敛,对评审/决策/推荐/头脑风暴等判断类任务产出比单一模型更可靠的结论。",
+  "author": {
+    "name": "sds.rs",
+    "email": "jack.sds5889@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mixture-of-agents",
+    "moa",
+    "multi-model",
+    "code-review",
+    "decision",
+    "brainstorm",
+    "committee",
+    "self-moa"
+  ]
+}
