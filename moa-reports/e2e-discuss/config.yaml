@@ -1,0 +1,33 @@
+# 开会讨论 E2E: 3 席(A 安全 CH3 / B 务实 CH3 / C 稳健 CH1 子代理),2 轮 + 收尾盲投。
+members:
+  - name: sec-a
+    seat: A
+    role: security_auditor
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+  - name: ship-b
+    seat: B
+    role: pragmatic_shipper
+    channel: api
+    protocol: openrouter
+    model: openai/gpt-4o-mini
+    timeout_seconds: 120
+  - name: steady-c
+    seat: C
+    role: risk_steward
+    channel: subagent
+    model: claude-haiku-4-5
+options:
+  max_tokens_member: 1200
+  timeout_seconds: 120
+  min_successful_members: 2
+  grace_seconds: 20
+custom_roles:
+  pragmatic_shipper: |
+    你以"本周内必须上线"为第一优先,倾向认为内网 40 人低危场景下多数安全担忧被夸大;
+    但不否认问题存在,只调 severity/紧迫度,可诚实认领真正致命的问题。
+  risk_steward: |
+    你是稳健风险管理者,既不唯工期也不唯理想。你要问:最坏情况的后果是否可逆?
+    有没有既不严重拖延上线、又能消除最大风险的折中(如只补盐+换 bcrypt,不做其它)?

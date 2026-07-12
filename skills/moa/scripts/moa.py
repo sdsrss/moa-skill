@@ -110,6 +110,37 @@ REFINE_PREAMBLE = (
     "不许因为多数人那么说就跟着改(那叫谄媚,不叫收敛)。按给定 JSON schema 输出。"
 )
 
+# ---------- 开会讨论 schema/preamble (§6 阶段5;仅 L3 且用户显式要求) ----------
+# 顺序发言、后发者可见此前发言(盲审的显式例外),多轮。头号风险=从众,故每回合强制
+# 标注"是否被新论据改变立场";收尾另有一次盲投(不看 transcript)做漂移检测。
+DISCUSS_SCHEMA = """严格只输出 JSON,不要 markdown 围栏,结构:
+{"still_holding":"你此刻仍坚持的核心立场(一句话)",
+ "responses":[{"to":"你回应的委员标签或其某个论点","stance":"agree|rebut|merge","reason":"理由(必填,不许空泛)"}],
+ "new_argument":"本轮你提出的、此前发言记录里无人提过的新论据(没有就填空串)",
+ "position_changed":true或false,
+ "changed_by_new_argument":true或false,
+ "current_stance":"你此刻的结论立场","confidence":0.0到1.0}
+硬规则:position_changed=true 时,changed_by_new_argument 必须如实——无新论据却随多数改立场=从众(会被机械计数),不是收敛。"""
+
+BLIND_VOTE_SCHEMA = """严格只输出 JSON,不要 markdown 围栏,结构:
+{"final_stance":"不看讨论记录,仅凭简报与你自己的判断复述的最终立场",
+ "confidence":0.0到1.0,"key_reason":"支撑该立场最关键的一条理由"}
+字段必填。"""
+
+DISCUSS_PREAMBLE = (
+    "这是【开会讨论】:顺序发言,你能看到此前发言者的发言(这是本模式对盲审原则的显式例外)。"
+    "发言只署名到'委员X(角色)',不暴露模型身份——只认论据不认出处。"
+    "轮到你时:(1)明确你仍坚持的立场;(2)逐条回应你同意/反驳/合并的他人观点并给理由;"
+    "(3)只有当出现你此前没考虑到的【新论据】时才可改变立场,并把 changed_by_new_argument 标 true、"
+    "在 new_argument 写清是哪条。无新论据却随多数改立场=从众,不是收敛。按给定 JSON schema 输出。"
+)
+
+BLINDVOTE_PREAMBLE = (
+    "讨论已结束。现在【不参考任何讨论记录】,仅凭简报和你自己的独立判断,复述你的最终立场。"
+    "这是为检测讨论是否让你无理由漂移——若讨论确实用新论据改变了你,如实反映;若没有,坚持你本来的判断。"
+    "按给定 JSON schema 输出。"
+)
+
 # ---------- 角色 prompt 加载 ----------
 
 ROLE_FILES = {
@@ -422,6 +453,94 @@ def run_member_refine(member, mode, material, own_prior, others_prior, opts, cus
     return _dispatch_channels(member, role_key, system, user, opts)
 
 
+# ---------- 开会讨论: 顺序回合 + 收尾盲投(§6 阶段5) ----------
+
+def _speaker_label(turn: dict) -> str:
+    """发言署名只到 席位+角色,不暴露模型身份(讨论里也不给'大牌压人'留口子)。"""
+    return f"委员{turn.get('seat', '?')}({turn.get('role', '?')})"
+
+
+def format_transcript(turns: list) -> str:
+    """把已落盘的回合(turn 非空)按轮次格式化成可见发言记录。空=首位发言者无记录。"""
+    visible = [t for t in turns if t.get("turn")]
+    if not visible:
+        return "(你是本轮第一位发言者,暂无此前发言。)"
+    by_round = {}
+    for t in visible:
+        by_round.setdefault(t.get("round", 1), []).append(t)
+    lines = []
+    for rnd in sorted(by_round):
+        lines.append(f"—— 第 {rnd} 轮 ——")
+        for t in by_round[rnd]:
+            p = t["turn"]
+            resp = "; ".join(f"[{r.get('stance')}→{r.get('to')}] {r.get('reason', '')}"
+                             for r in p.get("responses", []))
+            lines.append(f"{_speaker_label(t)}: 立场「{p.get('current_stance', '')}」"
+                         + (f" | 新论据: {p['new_argument']}" if p.get("new_argument") else "")
+                         + (f" | 回应: {resp}" if resp else ""))
+    return "\n".join(lines)
+
+
+def discuss_prompt(member, mode, material, transcript_str, round_no, custom_roles, blind=False):
+    """构造讨论回合(或盲投)的 (system, user)。CH1 子代理由仲裁人用同一 prompt 外派发,保证一致。"""
+    role_key = _seat_role(member, mode)
+    if blind:
+        system = (BLINDVOTE_PREAMBLE + "\n\n你的角色:\n"
+                  + load_role_prompt(mode, role_key, custom_roles) + "\n\n" + BLIND_VOTE_SCHEMA)
+        user = f"简报:\n\n{material}"
+        return system, user
+    system = (DISCUSS_PREAMBLE + "\n\n你的角色:\n"
+              + load_role_prompt(mode, role_key, custom_roles) + "\n\n" + DISCUSS_SCHEMA)
+    user = (f"简报:\n\n{material}\n\n"
+            f"此前发言记录:\n{transcript_str}\n\n"
+            f"现在轮到你(第 {round_no} 轮)发言。")
+    return system, user
+
+
+def run_member_discuss_turn(member, mode, material, transcript_str, round_no, opts, custom_roles):
+    role_key = _seat_role(member, mode)
+    system, user = discuss_prompt(member, mode, material, transcript_str, round_no, custom_roles)
+    res = _dispatch_channels(member, role_key, system, user, opts)
+    res["round"] = round_no
+    return res
+
+
+def run_member_blindvote(member, mode, material, opts, custom_roles):
+    role_key = _seat_role(member, mode)
+    system, user = discuss_prompt(member, mode, material, "", 0, custom_roles, blind=True)
+    return _dispatch_channels(member, role_key, system, user, opts)
+
+
+def load_transcript(collect_dir: Path) -> list:
+    """读 discussion.jsonl(每行一个回合信封);不存在则空。"""
+    p = Path(collect_dir) / "discussion.jsonl"
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            out.append(json.loads(line))
+    return out
+
+
+def append_transcript(collect_dir: Path, envelope: dict):
+    p = Path(collect_dir) / "discussion.jsonl"
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+
+
+def _turn_envelope(res: dict, round_no: int) -> dict:
+    """把 _dispatch_channels/注入结果规约成 transcript 回合信封。"""
+    return {
+        "round": round_no, "seat": res.get("seat", "?"), "name": res.get("name"),
+        "role": res.get("role"), "channel_used": res.get("channel_used"),
+        "model_used": res.get("model_used"), "turn": res.get("parsed"),
+        "usage": res.get("usage"), "latency_s": res.get("latency_s", 0.0),
+        "error": res.get("error"), "err_class": res.get("err_class"),
+    }
+
+
 def _fail(member, role_key, msg, err_class, t0=None):
     return {
         "name": member["name"], "seat": member.get("seat", "?"), "role": role_key,
@@ -676,6 +795,63 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
         base.update(cross_exam_by_severity=exam, option_shifts=shifts,
                     early_stop_suggested=len(cur_opts) == 1)
     return base
+
+
+def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
+    """开会讨论统计: 从众计数(无新论据却改立场) + 假讨论(整轮无新论据) + 盲投漂移对照 + 保留分歧。
+    transcript = discussion.jsonl 全部回合;blindvotes = blindvote_<seat>.json 的 parsed 列表(可空)。"""
+    ok = [t for t in transcript if t.get("turn")]
+    rounds = sorted({t.get("round", 1) for t in ok})
+    # 从众: 任一回合 position_changed 却非 changed_by_new_argument
+    conformity = []
+    for t in ok:
+        p = t["turn"]
+        if p.get("position_changed") and not p.get("changed_by_new_argument"):
+            conformity.append({"seat": t.get("seat"), "role": t.get("role"),
+                               "round": t.get("round"), "current_stance": p.get("current_stance")})
+    # 假讨论: 整轮所有发言 new_argument 皆空(无信息增量)
+    pseudo_rounds = []
+    for rnd in rounds:
+        turns = [t["turn"] for t in ok if t.get("round") == rnd]
+        if turns and all(not (x.get("new_argument") or "").strip() for x in turns):
+            pseudo_rounds.append(rnd)
+    # 盲投漂移对照: 只给出(讨论终态 vs 盲投终态)配对,语义是否漂移交仲裁人判(不假装机械判等)
+    last_by_seat = {}
+    for t in ok:
+        last_by_seat[t.get("seat")] = t   # rounds 升序遍历,末次覆盖
+    bv_by_seat = {b.get("seat"): b for b in (blindvotes or []) if b.get("seat")}
+    drift_pairs = []
+    for seat, t in last_by_seat.items():
+        bv = bv_by_seat.get(seat)
+        drift_pairs.append({
+            "seat": seat, "role": t.get("role"),
+            "discussion_final": t["turn"].get("current_stance"),
+            "blind_final": (bv.get("vote") or {}).get("final_stance") if bv else None,
+        })
+    # 保留分歧: 末态各席 still_holding + 未化解的 rebut
+    dissent = []
+    for seat, t in last_by_seat.items():
+        p = t["turn"]
+        rebuts = [r for r in p.get("responses", []) if r.get("stance") == "rebut"]
+        dissent.append({"seat": seat, "role": t.get("role"),
+                        "still_holding": p.get("still_holding"),
+                        "open_rebuttals": [r.get("reason") for r in rebuts]})
+    usages = [t.get("usage") for t in ok] + [
+        (b.get("usage") if isinstance(b, dict) else None) for b in (blindvotes or [])]
+    return {
+        "rounds": len(rounds),
+        "turns_ok": len(ok),
+        "turns_failed": len([t for t in transcript if not t.get("turn")]),
+        "participants": sorted({t.get("seat") for t in ok}),
+        "conformity_alerts": conformity,
+        "conformity_alert": len(conformity) > 0,
+        "pseudo_discussion_rounds": pseudo_rounds,
+        "early_stop_suggested": bool(pseudo_rounds and pseudo_rounds[-1] == rounds[-1]) if rounds else False,
+        "blind_vote_drift_pairs": drift_pairs,
+        "dissent_preserved": dissent,
+        "token_usage": {**_merge_usage(*usages),
+                        "billed_members": sum(1 for u in usages if u)},
+    }
 
 
 # ---------- 安全: 敏感材料 / 密钥泄漏扫描 (§8 SAFETY) ----------
@@ -976,6 +1152,100 @@ def cmd_refine(args, cfg):
     print(f"[refine r{round_no}] done: {len(ok)}/{len(dispatchable)} ok -> {collect}", file=sys.stderr)
 
 
+def _inject_result(member, mode, parsed) -> dict:
+    """把仲裁人外派发的 CH1 子代理 JSON 规约成 _dispatch_channels 同形结果(供 --inject)。"""
+    role_key = _seat_role(member, mode)
+    return {
+        "name": member["name"], "seat": member.get("seat", "?"), "role": role_key,
+        "model_used": member.get("model"), "protocol": member.get("protocol", "subagent"),
+        "channel_used": "subagent (arbiter-dispatched)",
+        "raw": json.dumps(parsed, ensure_ascii=False) if parsed else "",
+        "parsed": parsed, "usage": None, "latency_s": 0.0,
+        "error": None if parsed else "inject parse failed",
+        "err_class": None if parsed else "inject_parse",
+    }
+
+
+def _one_member(cfg, member_filter, what):
+    members = _select_members(cfg, member_filter)
+    if len(members) != 1:
+        sys.exit(f"{what} 需恰好一个 --member(开会讨论按发言序逐席进行);收到 {len(members)}")
+    return members[0]
+
+
+def cmd_discuss_turn(args, cfg):
+    """开会讨论单回合(§6 阶段5): 一位委员看见此前发言、发言、追加到 discussion.jsonl。
+    CH2/CH3 席由本命令直接派发;CH1 席由仲裁人用 discuss-prompt 取词外派发,再 --inject 回填。"""
+    material = Path(args.input).read_text(encoding="utf-8")
+    opts = cfg["options"]
+    custom_roles = cfg.get("custom_roles", {}) or {}
+    m = _one_member(cfg, args.member, "discuss-turn")
+    collect = Path(args.collect_dir)
+    collect.mkdir(parents=True, exist_ok=True)
+    round_no = args.round
+    if args.inject:
+        parsed = parse_json(Path(args.inject).read_text(encoding="utf-8"))
+        if parsed is None:
+            sys.exit(f"--inject 内容非合法 JSON: {args.inject}")
+        res = _inject_result(m, args.mode, parsed)
+    else:
+        transcript_str = format_transcript(load_transcript(collect))
+        res = run_member_discuss_turn(m, args.mode, material, transcript_str, round_no, opts, custom_roles)
+    append_transcript(collect, _turn_envelope(res, round_no))
+    status = "OK" if res["parsed"] else f"FAIL[{res['err_class']}]: {res['error']}"
+    print(f"[discuss r{round_no}] {m['name']} ({res['role']}) via {res.get('channel_used') or '-'}: {status}",
+          file=sys.stderr)
+
+
+def cmd_discuss_prompt(args, cfg):
+    """打印某席本回合(或盲投,--blind)的 system/user 精确 prompt,供仲裁人给 CH1 子代理用同一提示词。"""
+    material = Path(args.input).read_text(encoding="utf-8")
+    custom_roles = cfg.get("custom_roles", {}) or {}
+    m = _one_member(cfg, args.member, "discuss-prompt")
+    transcript_str = format_transcript(load_transcript(Path(args.collect_dir)))
+    system, user = discuss_prompt(m, args.mode, material, transcript_str, args.round, custom_roles, blind=args.blind)
+    print("===SYSTEM===\n" + system + "\n\n===USER===\n" + user)
+
+
+def cmd_discuss_blindvote(args, cfg):
+    """收尾盲投(漂移检测): 委员不看讨论记录,仅凭简报独立复述最终立场。写 blindvote_<seat>.json。"""
+    material = Path(args.input).read_text(encoding="utf-8")
+    opts = cfg["options"]
+    custom_roles = cfg.get("custom_roles", {}) or {}
+    m = _one_member(cfg, args.member, "discuss-blindvote")
+    collect = Path(args.collect_dir)
+    collect.mkdir(parents=True, exist_ok=True)
+    if args.inject:
+        parsed = parse_json(Path(args.inject).read_text(encoding="utf-8"))
+        if parsed is None:
+            sys.exit(f"--inject 内容非合法 JSON: {args.inject}")
+        res = _inject_result(m, args.mode, parsed)
+    else:
+        res = run_member_blindvote(m, args.mode, material, opts, custom_roles)
+    bv = {"seat": res.get("seat"), "name": res.get("name"), "role": res.get("role"),
+          "channel_used": res.get("channel_used"), "model_used": res.get("model_used"),
+          "vote": res.get("parsed"), "usage": res.get("usage"),
+          "error": res.get("error"), "err_class": res.get("err_class")}
+    out = collect / f"blindvote_{res.get('seat')}.json"
+    out.write_text(json.dumps(bv, ensure_ascii=False, indent=1), encoding="utf-8")
+    status = "OK" if res["parsed"] else f"FAIL[{res['err_class']}]"
+    print(f"[blindvote] {m['name']} ({res['role']}): {status} -> {out}", file=sys.stderr)
+
+
+def cmd_discuss_stats(args, cfg):
+    collect = Path(args.collect_dir)
+    transcript = load_transcript(collect)
+    if not transcript:
+        sys.exit(f"no discussion.jsonl in {collect} (先跑 discuss-turn)")
+    blindvotes = [json.loads(p.read_text(encoding="utf-8"))
+                  for p in sorted(collect.glob("blindvote_*.json"))]
+    stats = compute_discuss_stats(transcript, blindvotes)
+    out = collect / "discuss_stats.json"
+    out.write_text(json.dumps(stats, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(json.dumps(stats, ensure_ascii=False, indent=1))
+    print(f"\n[discuss-stats] -> {out}", file=sys.stderr)
+
+
 def cmd_dry_run(args, cfg):
     material = Path(args.input).read_text(encoding="utf-8") if args.input else ""
     dry_run(cfg, args.mode, material, args.topic, args.refine_rounds)
@@ -1030,6 +1300,18 @@ def main():
     lc = sub.add_parser("leak-check")
     lc.add_argument("paths", nargs="*",
                     help="要扫描的路径;省略则扫描产物/文档/配置/skill 本体(不含 tests/)")
+    # 开会讨论(§6 阶段5): 逐回合、可注入 CH1、盲投、统计
+    dt = sub.add_parser("discuss-turn"); common(dt)
+    dt.add_argument("--round", type=int, default=1)
+    dt.add_argument("--inject", default=None, help="CH1 子代理返回 JSON 的文件路径,回填该席回合")
+    dpp = sub.add_parser("discuss-prompt"); common(dpp)
+    dpp.add_argument("--round", type=int, default=1)
+    dpp.add_argument("--blind", action="store_true", help="打印盲投 prompt 而非讨论回合 prompt")
+    dbv = sub.add_parser("discuss-blindvote"); common(dbv)
+    dbv.add_argument("--inject", default=None, help="CH1 子代理盲投 JSON 的文件路径")
+    dst = sub.add_parser("discuss-stats")
+    dst.add_argument("--config", default=None)
+    dst.add_argument("--collect-dir", default="moa-reports/run")
 
     args = ap.parse_args()
     if args.phase == "leak-check":       # 静态自查不需要 config
@@ -1038,6 +1320,8 @@ def main():
     cfg = resolve_config(getattr(args, "config", None))
     cfg = apply_custom_committee(cfg, args)   # --models 给了就覆盖 members(custom 模式)
     {"generate": cmd_generate, "refine": cmd_refine,
+     "discuss-turn": cmd_discuss_turn, "discuss-prompt": cmd_discuss_prompt,
+     "discuss-blindvote": cmd_discuss_blindvote, "discuss-stats": cmd_discuss_stats,
      "stats": cmd_stats, "dry-run": cmd_dry_run}[args.phase](args, cfg)
 
 

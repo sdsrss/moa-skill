@@ -7,7 +7,7 @@ description: MoA 多模型委员会——把当前 agent(仲裁人)与最多4个
 
 把多个异构大模型组成"委员会":委员互相隔离、各领角色独立盲审,当前 agent 作为仲裁人按硬规则收敛。原理基于 Mixture-of-Agents——不同模型盲点不同,独立盲审 + 结构化聚合能突破单模型上限。角色契约、收敛硬规则与简报模板见本目录 `references/`。
 
-> **实现状态:M4 基本完成(v1.0)**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、主席综合/仲裁/策展、auto 路由、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。三通道(CH1 子代理 / CH2 codex / CH3 API)、Self-MoA、评审/决策/头脑风暴均经真实端到端验证。
+> **实现状态:M4 基本完成(v1.0)**。已可用:三通道(CH2 codex CLI + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。三通道(CH1 子代理 / CH2 codex / CH3 API)、Self-MoA、评审/决策/头脑风暴均经真实端到端验证。
 
 ## 三种调用模式
 
@@ -75,6 +75,10 @@ python skills/moa/scripts/moa.py stats --mode review --collect-dir moa-reports/r
 ```
 
 CH1 子代理席位的精炼同样由你脚本外派发,产物写 `member_<name>.r1.json`。精炼 `stats.r1.json` 给出:三态计票、`disputed_titles`(一票 challenge 即锁)、`sycophancy_alert`(>50% 无理由翻向多数派)、`early_stop_suggested`(全一致且无 disputed → 不必再来一轮)。默认 L1=0 / L2≤1 / L3≤2 轮。头脑风暴无精炼轮。
+
+## 第 3.6 步:开会讨论(可选,仅 L3 + 用户显式要求)
+
+顺序发言、后发者可见前发言(盲审的显式例外)、多轮——**成本最高、从众风险最高**,只在高价值不可逆决策 + 委员精炼后仍根本分歧 + 用户明确要"真辩一轮"时用。轻量分歧用第 3.5 步匿名互评即可。由你(仲裁人)**逐回合编排**,`moa.py` 提供 `discuss-turn`/`discuss-prompt`/`discuss-blindvote`/`discuss-stats` 助手;CH1 席用 `discuss-prompt` 取词外派发再 `--inject` 回填。三重反从众对冲(发言序轮转 / 每回合"是否被新论据改变"标注 / 收尾盲投漂移检测)与完整编排步骤见 `references/discuss.md`。
 
 ## 第 4 步:收敛(你作为仲裁人)
 

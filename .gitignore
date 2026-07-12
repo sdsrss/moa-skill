@@ -40,3 +40,6 @@ node_modules/
 # 保留 COST-NOTE.md / brief.md / config.yaml 作可复现证据样例(见 moa-reports/cost-m4/)。
 moa-reports/**/member_*.json
 moa-reports/**/stats*.json
+moa-reports/**/discussion.jsonl
+moa-reports/**/blindvote_*.json
+moa-reports/**/discuss_stats.json
