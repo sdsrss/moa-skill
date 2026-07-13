@@ -28,9 +28,35 @@ import moa  # noqa: E402
     ('这是我的判断:\n{"a":1,"b":[2,3]}\n以上。', {"a": 1, "b": [2, 3]}),
     ('no json here', None),
     ('{bad json', None),
+    # 顶层是合法 JSON 但非对象(数组/标量/bool/null): 委员响应 schema 一律是对象,
+    # 非对象不是有效响应。单对象数组 → 抠出该对象;多对象/标量 → 判失败(None),交修复轮/计失败。
+    ('[{"a":1}]', {"a": 1}),            # 模型把响应包成单元素数组 → 恢复出对象
+    ('true', None),
+    ('42', None),
+    ('"just a string"', None),
+    ('[1,2,3]', None),                  # 纯标量数组,无对象可抠
 ])
 def test_parse_json(text, expect):
     assert moa.parse_json(text) == expect
+
+
+def test_stats_tolerates_non_object_member_output(tmp_path):
+    """委员输出为「合法但非对象」JSON(如数组/标量)时,stats 不得崩溃,应把该席计为 failed。
+    回归 ISSUE-001: 旧代码 parse_json 返回 list/bool,被 compute_stats 当 dict 调 .get() → AttributeError。"""
+    good = {"name": "ok-a", "seat": "A", "role": "feasibility_skeptic", "model_used": "m",
+            "channel_used": "api", "raw": "{}",
+            "parsed": {"verdict": "pass", "confidence": 0.8, "issues": []},
+            "usage": None, "latency_s": 1.0, "error": None, "err_class": None}
+    bad = {"name": "bad-b", "seat": "B", "role": "maintainability_reviewer", "model_used": "m",
+           "channel_used": "api", "raw": "[...]",
+           "parsed": ["not", "an", "object"],   # 已落盘的非对象 parsed(历史产物 / 手工注入)
+           "usage": None, "latency_s": 1.0, "error": None, "err_class": None}
+    (tmp_path / "member_ok-a.json").write_text(json.dumps(good), encoding="utf-8")
+    (tmp_path / "member_bad-b.json").write_text(json.dumps(bad), encoding="utf-8")
+    stats = moa.compute_stats("review", [good, bad])
+    assert stats["members_ok"] == 1        # 只有 ok-a 算成功
+    assert stats["members_failed"] == 1    # 非对象的 bad-b 计入 failed
+    assert stats["degraded"] is True
 
 
 # ---------- 代理判定 no_proxy 边界 ----------

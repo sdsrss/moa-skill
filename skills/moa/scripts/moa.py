@@ -306,17 +306,25 @@ def _merge_usage(*usages) -> dict:
 
 
 def parse_json(text: str):
+    """返回 dict 或 None。委员响应 schema 顶层一律是对象——顶层解析出非 dict(数组/标量/
+    bool/null)不是有效响应,不能当成功值向下游传递(否则 compute_stats 等对它调 .get() → 崩溃,
+    修 ISSUE-001)。顶层非对象时仍尝试从文本里抠出首个 {...} 对象(如模型把响应包成单元素数组
+    `[{...}]`),抠不出对象则判 None,交修复轮或计为失败席。"""
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.M).strip()
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                return None
-        return None
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=None):
@@ -835,16 +843,24 @@ def _aggregate_usage(ok_results: list) -> dict:
     return agg
 
 
+def _parsed_ok(r) -> bool:
+    """成功席判据: parsed 必须是【对象】。合法但非 dict 的 JSON(数组/标量/bool)不是有效委员
+    响应,不能计入共识——否则下游对它调 .get() 会崩溃(修 ISSUE-001)。moa.py 生成的 parsed 经
+    parse_json 已保证 dict-or-None;但 CH1 席由仲裁人脚本外手写 member_*.json、或历史/误编辑产物
+    可能带非对象 parsed,聚合层须自证健壮,不靠上游。"""
+    return isinstance(r.get("parsed"), dict)
+
+
 def compute_stats(mode: str, results: list) -> dict:
-    ok = [r for r in results if r.get("parsed")]
-    failed = [r for r in results if not r.get("parsed")]
+    ok = [r for r in results if _parsed_ok(r)]
+    failed = [r for r in results if not _parsed_ok(r)]
     base = {
         "degraded": len(failed) > 0,
         "members_ok": len(ok),
         "members_failed": len(failed),
         "roster": [{"name": r["name"], "seat": r.get("seat"),
                     "model_used": r.get("model_used"), "channel_used": r.get("channel_used"),
-                    "ok": bool(r.get("parsed"))} for r in results],
+                    "ok": _parsed_ok(r)} for r in results],
         "failures": [{"name": r["name"], "err_class": r.get("err_class"), "error": r.get("error")}
                      for r in failed],
         "token_usage": _aggregate_usage(ok),
@@ -895,7 +911,7 @@ def anonymize_others(all_results, exclude_name):
     out = []
     i = 0
     for r in all_results:
-        if r["name"] == exclude_name or not r.get("parsed"):
+        if r["name"] == exclude_name or not _parsed_ok(r):  # 非对象意见不喂给互评轮(ISSUE-001)
             continue
         out.append({"评审员": ANON_LABELS[i % len(ANON_LABELS)], "意见": r["parsed"]})
         i += 1
@@ -905,7 +921,7 @@ def anonymize_others(all_results, exclude_name):
 def _majority_verdict(results, field):
     tally = {}
     for r in results:
-        if r.get("parsed"):
+        if _parsed_ok(r):
             v = r["parsed"].get(field)
             if v is not None:
                 tally[v] = tally.get(v, 0) + 1
@@ -921,7 +937,7 @@ def _majority_verdict(results, field):
 def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -> dict:
     """精炼轮统计(design.md §7.3): 三态计票、一票 challenge 锁 disputed、谄媚计数器、早停信号。
     prior_results = 上一轮(生成或前一精炼轮)产物;refine_results = 本精炼轮产物。"""
-    ok = [r for r in refine_results if r.get("parsed")]
+    ok = [r for r in refine_results if _parsed_ok(r)]
     base: dict = {
         "round_members_ok": len(ok),
         "round_members_failed": len(refine_results) - len(ok),
@@ -939,7 +955,7 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
                     if t:
                         challenged_titles[t] = challenged_titles.get(t, 0) + 1
         # 谄媚计数器: 相对上一轮,verdict 向上一轮多数派翻转、且本轮该员未提出任何 challenge(无新证据代理)
-        prior_by = {r["name"]: r for r in prior_results if r.get("parsed")}
+        prior_by = {r["name"]: r for r in prior_results if _parsed_ok(r)}
         majority = _majority_verdict(prior_results, "verdict")
         flips_toward_majority = 0
         movers = 0
@@ -974,7 +990,7 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
     elif mode == "decide":
         exam = {"fatal": 0, "major": 0, "minor": 0}
         shifts = 0
-        prior_by = {r["name"]: r for r in prior_results if r.get("parsed")}
+        prior_by = {r["name"]: r for r in prior_results if _parsed_ok(r)}
         for r in ok:
             for e in r["parsed"].get("cross_exam", []) or []:
                 s = e.get("attack_severity", "minor")
@@ -992,7 +1008,7 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
 def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
     """开会讨论统计: 从众计数(无新论据却改立场) + 假讨论(整轮无新论据) + 盲投漂移对照 + 保留分歧。
     transcript = discussion.jsonl 全部回合;blindvotes = blindvote_<seat>.json 的 parsed 列表(可空)。"""
-    ok = [t for t in transcript if t.get("turn")]
+    ok = [t for t in transcript if isinstance(t.get("turn"), dict)]  # turn 须为对象,否则下游 .get() 崩溃(ISSUE-001)
     rounds = sorted({t.get("round", 1) for t in ok})
     # 从众: 任一回合 position_changed 却非 changed_by_new_argument
     conformity = []
@@ -1033,7 +1049,7 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
     return {
         "rounds": len(rounds),
         "turns_ok": len(ok),
-        "turns_failed": len([t for t in transcript if not t.get("turn")]),
+        "turns_failed": len([t for t in transcript if not isinstance(t.get("turn"), dict)]),
         "participants": sorted({t.get("seat") for t in ok}),
         "conformity_alerts": conformity,
         "conformity_alert": len(conformity) > 0,
