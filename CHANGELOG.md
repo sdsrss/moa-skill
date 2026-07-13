@@ -3,6 +3,54 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.5.0] — 2026-07-13
+
+> **Migration note (user-visible default change)**: the default committee now fields a **genuine
+> fourth family** — seat D moved from a free second-Anthropic Self-MoA subagent to
+> **Moonshot `kimi-k2.7` via auggie**. This fixes a correlation the v1.4.0-audit flagged: seats
+> B, D **and your Claude arbiter** were all Anthropic (3 of 5 judging minds one family), so
+> "everyone agrees" was weaker evidence than it looked. **Cost impact**: the default now bills
+> **3 seats (A/C/D) instead of 2** — one more auggie seat at upstream API price +40%.
+> **Opt-out / revert**: swap seat D back to an Opus subagent (exact block commented in
+> `config.example.yaml`) to restore the cheaper v1.4.0 mix; on machines without auggie the seat
+> auto-falls-back to codex. Always `dry-run` first — it now shows the 3-billed-seat estimate.
+
+### Added
+- **GitHub Actions CI** (`.github/workflows/ci.yml`): runs the test suite + `leak-check` on
+  push/PR across Python 3.9 and 3.12; on release tags verifies six-place version consistency
+  (`bump-version.sh --check`), that `plugin.json` version equals the tag, and that the README
+  test-count badge equals the collected suite size. Closes the "quality gate was local-only /
+  badge drifted 126→137→162 by hand" gap (audit F1).
+- **Fourth-family default committee**: seat D = `kimi-k2.7` via auggie with a codex fallback for
+  auggie-less environments (audit §7; E2E-verified: D-seat generate landed a parsed review in
+  64.7s).
+
+### Changed
+- **Config-validation warning (audit F5)**: a `channel: cli` seat left on `cli_kind: auto` with a
+  `model` but no `auggie_model` now prints a non-blocking warning — auto prefers auggie and reads
+  only `auggie_model`, so the bare `model` would be silently overridden by auggie's default.
+- **dry-run billing hint (audit F6)**: a subscription-first seat (cli:codex) whose fallback chain
+  contains a billed channel now shows `⚠ fallback 含计费通道,降级时转计费` — the first-try
+  billing verdict alone under-counted the downgrade cost.
+
+### Fixed
+- **`refine` had no abort gate (audit F2)**: an all-seats-failed refine round printed `done` and
+  exited 0, so a scripted pipeline saw "refine happened" when it produced nothing. It now exits
+  non-zero on zero output (aligned with `generate`'s abort) and marks partial rounds `[DEGRADED]`.
+- **`early_stop_suggested` on incomplete evidence (audit F3)**: the refine early-stop signal fired
+  on unanimous *surviving* seats even when other seats failed that round (survivorship bias). It
+  is now suppressed whenever any seat failed the round (both review and decide branches).
+- **Majority-verdict tie-break (audit F4)**: `_majority_verdict` returned the dict-insertion-first
+  key on a tie, so a 2:2 split reported a spurious "majority" and mis-scored the sycophancy
+  baseline. Ties now return `None` (no majority).
+
+### Docs
+- Disclosed three inherent limits surfaced by the audit: cross-seat prompt-injection propagation
+  in refine/discuss rounds (F7), arbiter-same-family correlation in the consensus disclaimer
+  (audit §7), and self-reported confidence as an ordinal-only signal + non-comparable
+  novelty/feasibility scores across seats (synthesis judgment notes).
+- README: platform support stated (Linux/macOS tested, Windows unverified — audit F8).
+
 ## [1.4.0] — 2026-07-13
 
 > **Migration note**: bare `channel: cli` now means `cli_kind: auto` — when the `auggie` binary is

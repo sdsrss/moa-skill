@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.4.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-162%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.5.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-169%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -29,9 +29,9 @@ Built on **Mixture-of-Agents (MoA)**: different models have different blind spot
 
 ## Why MoA Skill
 
-One model reviewing its own work is one set of blind spots. MoA Skill convenes **up to four independent, heterogeneous models** across the OpenAI / Anthropic / Google / xAI families that never see each other's raw output during generation, then lets **your current agent — holding full context — arbitrate** under hard anti-groupthink rules. You get a second, third, fourth opinion that is *actually independent*, with disagreements surfaced rather than averaged away.
+One model reviewing its own work is one set of blind spots. MoA Skill convenes **up to four independent, heterogeneous models** across the OpenAI / Anthropic / Google / Moonshot families that never see each other's raw output during generation, then lets **your current agent — holding full context — arbitrate** under hard anti-groupthink rules. You get a second, third, fourth opinion that is *actually independent*, with disagreements surfaced rather than averaged away.
 
-> **On the default roster (v1.4.0):** the shipped `config.example.yaml` fields three families — OpenAI (gpt5.6-sol via auggie) + Anthropic (Opus subagents) + Google (gemini-3.1-pro via auggie) — plus a fourth **role-differentiated Self-MoA seat** (a second Anthropic model in an adversarial role). The fourth *family* is opt-in and now one comment-block away: swap seat D to `kimi-k2.7` via auggie (Moonshot — same account, no extra key). The older xAI/Grok option needs an OpenRouter key with x-ai supply (most are list-only 404); see the caveats in [`config.example.yaml`](skills/moa/assets/config.example.yaml). Family count is a config choice, not a hard-coded four.
+> **On the default roster (v1.5.0):** the shipped `config.example.yaml` now fields **four families** — OpenAI (gpt5.6-sol via auggie, seat A) + Anthropic (Opus subagent, seat B) + Google (gemini-3.1-pro via auggie, seat C) + **Moonshot (kimi-k2.7 via auggie, seat D)**. The v1.4.0 default put a second Anthropic model in seat D (a role-differentiated Self-MoA seat); the v1.5.0 audit flagged that seat B, seat D **and your Claude arbiter** were then all Anthropic (3 of 5 judging minds one family), so "everyone agrees" was less independent than it looked. Seat D now defaults to a genuine fourth family via auggie (same account, no extra key). To revert to the cheaper Self-MoA seat, swap seat D back to an Opus subagent — the exact block is commented in [`config.example.yaml`](skills/moa/assets/config.example.yaml). Family count is a config choice, not a hard-coded four.
 
 It is a **committee you summon on demand — not an auto-development pipeline.** Coding and fixing stay with your main agent; MoA is for the judgment-dense nodes: review, decision, arbitration, brainstorming.
 
@@ -95,7 +95,7 @@ cp skills/moa/assets/config.example.yaml config.yaml   # then edit models/channe
 
 ### Three convening scales
 
-- **`full`** (manual `/moa <material>`) — fixed 4 top-tier seats + arbiter (3 families + a Self-MoA seat by default).
+- **`full`** (manual `/moa <material>`) — fixed 4 top-tier seats + arbiter (four families by default: OpenAI / Anthropic / Google / Moonshot).
 - **`auto`** (keyword / self-invoked) — orchestrator picks seat count, models, and pipeline by **scenario × difficulty × stage** (`references/routing.md`).
 - **`custom`** (`--members N --models "id1,id2"`) — repeat one model = active **Self-MoA**.
 
@@ -107,7 +107,7 @@ Exponential backoff on 5xx/429 · one-shot JSON self-repair · dynamic quorum (`
 
 ## Highlights
 
-- 🧩 **Truly independent second opinions** — up to four model families, blind generation, so blind spots are de-correlated instead of echoed (default ships three families + a Self-MoA seat; see the note above).
+- 🧩 **Truly independent second opinions** — up to four model families, blind generation, so blind spots are de-correlated instead of echoed (default ships four families as of v1.5.0; see the note above).
 - ⚖️ **Arbiter with full context + anti-pollution clamps** — the aggregator is your main agent, kept honest by a statistics block, a falsification gate, and no-hedge / no-blocker-downgrade hard rules.
 - 💸 **Cost-adaptive, not always-on** — L0 gate refuses trivial questions; `scenario × difficulty × stage` routing; `--dry-run` shows the roster, channels, proxy state, and cost estimate *before* you spend a token.
 - 🛡️ **Anti-groupthink discipline stack** — blind isolation, anonymous cross-review, same-source consensus de-dup, sycophancy counter, three-state abstention, outlier protection, low-confidence hand-back.
@@ -168,7 +168,7 @@ Sequential speaking, later speakers see earlier turns (an explicit exception to 
 
 ## Cost
 
-Tokens run a few × a single model. Measured (2 billed seats + 1 refine round, on cheap non-reasoning models — see [`COST-NOTE.md`](moa-reports/cost-m4/COST-NOTE.md)) = **4.79× baseline**. The **shipped v1.4.0 default bills seats A & C via auggie** (upstream API price +40%, drawn from your Augment plan; B & D stay subscription subagents) — a deliberate stability-over-cost trade after headless codex timeouts and OpenRouter reasoning-model empty shells; set `cli_kind: codex` on A and `channel: api` on C to restore the cheaper pre-1.4.0 mix. **All-CH3 four seats + refine ≈ 9.6×** (over the 7× target). Always `dry-run` and show the estimate before a real run.
+Tokens run a few × a single model. Measured (2 billed seats + 1 refine round, on cheap non-reasoning models — see [`COST-NOTE.md`](moa-reports/cost-m4/COST-NOTE.md)) = **4.79× baseline**. The **shipped v1.5.0 default now bills three seats — A, C & D via auggie** (upstream API price +40%, drawn from your Augment plan; only seat B stays a subscription subagent). This is one more billed seat than v1.4.0: seat D moved from a free Anthropic Self-MoA subagent to Moonshot/kimi-k2.7 to buy a genuine fourth family — so real default cost is above the 4.79× measured on the 2-billed-seat config. To restore the cheaper pre-1.5.0 mix, revert seat D to an Opus subagent (commented in `config.example.yaml`); to drop auggie billing entirely, set `cli_kind: codex` on A and `channel: api` on C. **All-CH3 four seats + refine ≈ 9.6×** (over the 7× target). Always `dry-run` and show the estimate before a real run.
 
 ---
 
@@ -219,9 +219,13 @@ Per the MoA paper, aggregators benefit from full context while proposers don't �
 ## Development
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 162 cases (behavior + doc-consistency fixtures), no network
+python -m pytest skills/moa/tests/ -q      # 169 cases (behavior + doc-consistency fixtures), no network
 python skills/moa/scripts/moa.py leak-check # static secret-leak self-check: non-zero exit on hit (preview redacted)
 ```
+
+CI runs the suite + `leak-check` on push/PR across Python 3.9 and 3.12, and checks version/badge consistency on release tags (`.github/workflows/ci.yml`).
+
+**Platform:** tested on Linux and macOS. Windows is unverified — `subprocess`/path handling is likely fine, but the auggie/codex CLI behavior on Windows has not been exercised.
 
 Layout: `skills/moa/` — `SKILL.md` · `references/` ×7 (incl. `discuss.md`) · `scripts/moa.py` · `assets/config.example.yaml` · `tests/`. Only the manifest and `skills/` are loaded at runtime; `docs/`, `moa-reports/`, and `README*` are dev/record material.
 

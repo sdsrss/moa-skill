@@ -504,6 +504,13 @@ def _effective_billing(member) -> str:
     return "billed"
 
 
+def _fallback_has_billed(member) -> bool:
+    """member 的展开尝试链里是否含计费通道(api 或 cli:auggie)。供 dry-run 提示"首选订阅但
+    降级会转计费"(修 F6)——判的是整条链,与 _effective_billing 只判首 try 的口径互补。"""
+    return any((k == "api") or (k == "cli" and c.get("cli_kind") == "auggie")
+               for k, c, _ in resolve_channel(member))
+
+
 def _seat_role(member, mode):
     seat = member.get("seat", "?")
     return member.get("role") or DEFAULT_SEAT_ROLE.get((mode, seat)) or seat
@@ -892,7 +899,11 @@ def _majority_verdict(results, field):
                 tally[v] = tally.get(v, 0) + 1
     if not tally:
         return None
-    return max(tally, key=lambda k: tally[k])
+    # 平票无多数派(修 F4): 最高票并列时返回 None,不让 dict 插入序决定"多数派"——
+    # 否则 sycophancy 基准会把翻向"伪多数"误计为翻向多数(2:2 时 max() 取先插入的键)。
+    top = max(tally.values())
+    leaders = [k for k, c in tally.items() if c == top]
+    return leaders[0] if len(leaders) == 1 else None
 
 
 def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -> dict:
@@ -930,12 +941,16 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
                 movers += 1
                 made_challenge = any((v.get("stance") == "challenge")
                                      for v in r["parsed"].get("verdicts_on_others", []) or [])
-                if new_v == majority and not made_challenge:
+                # majority is not None 守卫(配合 F4 平票→None): 无多数派时不存在"翻向多数",
+                # 且防 new_v 亦为 None(verdict 缺失)时 None==None 误计一次 flip。
+                if majority is not None and new_v == majority and not made_challenge:
                     flips_toward_majority += 1
         sycophancy_alert = movers > 0 and (flips_toward_majority / movers) > 0.5
-        # 早停信号: 本轮 verdict 全一致 且 无 disputed
+        # 早停信号: 本轮 verdict 全一致 且 无 disputed 且 无席位失败(修 F3)——
+        # 有席位本轮失败则证据不全,失败席立场缺席,"全一致"可能是幸存者偏差,不建议早停。
         cur_verdicts = {r["parsed"].get("verdict") for r in ok}
-        early_stop = len(cur_verdicts) == 1 and not challenged_titles
+        early_stop = (len(cur_verdicts) == 1 and not challenged_titles
+                      and base["round_members_failed"] == 0)
         base.update(
             stance_tally=stance,
             disputed_titles=sorted(challenged_titles),       # 一票 challenge 即锁 disputed
@@ -957,7 +972,8 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
                 shifts += 1
         cur_opts = {r["parsed"].get("revised_claimed_option") for r in ok}
         base.update(cross_exam_by_severity=exam, option_shifts=shifts,
-                    early_stop_suggested=len(cur_opts) == 1)
+                    early_stop_suggested=(len(cur_opts) == 1     # 修 F3: 同 review,有失败席不早停
+                                          and base["round_members_failed"] == 0))
     return base
 
 
@@ -1136,8 +1152,15 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
     for m in members:
         ch = m.get("channel", "api")
         bill = _effective_billing(m)
-        # 配置写 subagent 但因 api fallback 实走计费时,显式警示——否则成本被低估
-        flag = "  ⚠ 实走 api fallback=计费" if ch == "subagent" and bill == "billed" else ""
+        # 配置写 subagent 但因 fallback 实走计费(api 或 auggie)时,显式警示——否则成本被低估
+        if ch == "subagent" and bill == "billed":
+            flag = "  ⚠ 实走计费 fallback"
+        # 首选订阅通道(codex)但 fallback 链里含计费通道时提示: 首选失败降级即转计费(修 F6)。
+        # _effective_billing 只判首 try(最可能路径,口径不变),此处补链上计费面的可见性。
+        elif bill == "sub" and _fallback_has_billed(m):
+            flag = "  ⚠ fallback 含计费通道,降级时转计费"
+        else:
+            flag = ""
         print(f"{m['name']:<18}{m.get('seat','?'):<6}{ch:<10}{m.get('model',''):<28}{m.get('protocol','-')}{flag}")
         if bill == "sub":
             api_calls_sub += 1
@@ -1191,6 +1214,14 @@ def validate_config(cfg):
         ck = m.get("cli_kind", "auto")
         if ck not in ("auto", "codex", "auggie"):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) cli_kind={ck!r} 非法(应为 auto/codex/auggie)")
+        # 告警(不阻断,修 F5): channel=cli + auto(默认)+ 设了 model 但无 auggie_model 时,
+        # 检测到 auggie 会优先走 auggie 且只认 auggie_model(两侧 ID 命名空间不同),member.model 被
+        # 静默忽略、auggie 用其默认模型顶替——委员构成偏离配置意图且 model_used 记 None。指名提示。
+        if ch == "cli" and ck == "auto" and m.get("model") and not m.get("auggie_model"):
+            print(f"[config] ⚠ members[{i}] ({m.get('name')}) channel=cli 未显式 cli_kind(=auto),"
+                  f"检测到 auggie 时优先走 auggie 且只认 auggie_model;你设了 model={m['model']!r} 但无 "
+                  f"auggie_model,auggie 路径会用其默认模型顶替。要精确控制请显式 cli_kind 或补 auggie_model。",
+                  file=sys.stderr)
         names.append(m["name"])
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
@@ -1373,7 +1404,16 @@ def cmd_refine(args, cfg):
     results = dispatch_with_quorum(
         dispatchable, one, quorum_target, opts.get("grace_seconds", 30), on_done=_log_write)
     ok = [r for r in results if r["parsed"]]
-    print(f"[refine r{round_no}] done: {len(ok)}/{len(dispatchable)} ok -> {collect}", file=sys.stderr)
+    # 止损门(修 F2): 有可派发席却全数精炼失败 → 本轮无产出,非零退出,与 cmd_generate 的 abort 对齐。
+    # (失败席保留上轮意见是设计——但"全员失败"意味整轮零信息增量,静默 exit 0 会让脚本化串命令
+    #  误以为精炼发生过。dispatchable 为空=全 CH1 配置,由仲裁人外派发,不在此门内。)
+    if dispatchable and not ok:
+        sys.exit(f"[refine r{round_no}] abort: 0/{len(dispatchable)} 可派发席产出精炼意见 —— "
+                 f"本轮精炼无产出(失败席沿用上轮意见,但整轮零信息增量)。排查上游错误后重试,"
+                 f"或直接用上一轮产物收敛。")
+    degraded = len(ok) < len(dispatchable)
+    tag = " [DEGRADED: 部分席位精炼失败,保留其上轮意见]" if degraded else ""
+    print(f"[refine r{round_no}] done: {len(ok)}/{len(dispatchable)} ok{tag} -> {collect}", file=sys.stderr)
 
 
 def _inject_result(member, mode, parsed) -> dict:

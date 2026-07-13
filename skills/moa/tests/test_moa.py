@@ -221,6 +221,63 @@ def test_validate_config_accepts_valid():
                          "options": {"max_tokens_member": 100}})
 
 
+# ---------- F5: auto cli_kind + model 无 auggie_model → 告警(不阻断) ----------
+
+def test_validate_config_warns_auto_cli_model_without_auggie_model(capsys):
+    """F5: channel=cli + auto(默认)+ 设了 model 但无 auggie_model → 打告警
+    (auggie 优先且只认 auggie_model,member.model 会被静默顶替)。不阻断(不抛 SystemExit)。"""
+    moa.validate_config({"members": [{"name": "a", "channel": "cli", "model": "gpt5.6-sol"}],
+                         "options": {}})
+    err = capsys.readouterr().err
+    assert "auggie_model" in err and "顶替" in err
+
+
+def test_validate_config_no_warn_when_auggie_model_present(capsys):
+    """显式 auggie_model(或显式 cli_kind)→ 无 F5 告警。"""
+    moa.validate_config({"members": [
+        {"name": "a", "channel": "cli", "model": "x", "auggie_model": "gpt5.6-sol"},
+        {"name": "b", "channel": "cli", "cli_kind": "codex", "model": "y"},  # 显式 kind → 无告警
+    ], "options": {}})
+    assert "顶替" not in capsys.readouterr().err
+
+
+# ---------- F2: cmd_refine 全席精炼失败 → 非零退出(本轮零产出) ----------
+
+def test_cmd_refine_aborts_when_all_fail(tmp_path, monkeypatch):
+    brief = tmp_path / "b.md"; brief.write_text("brief", encoding="utf-8")
+    collect = tmp_path / "out"; collect.mkdir()
+    # 上一轮产物(round 0)存在,供精炼读取 own_prior
+    prior = {"name": "a", "seat": "A", "role": "r", "parsed": {"verdict": "fail"}}
+    (collect / "member_a.json").write_text(json.dumps(prior), encoding="utf-8")
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "m"}],
+           "options": {"timeout_seconds": 60, "max_tokens_member": 100,
+                       "min_successful_members": 1, "grace_seconds": 0}}
+    monkeypatch.setattr(moa, "run_member_refine",
+                        lambda *a, **k: moa._fail({"name": "a", "seat": "A"}, "r", "boom", "transient"))
+    args = types.SimpleNamespace(input=str(brief), member=None, collect_dir=str(collect),
+                                 mode="review", round=1)
+    with pytest.raises(SystemExit):
+        moa.cmd_refine(args, cfg)
+
+
+# ---------- F6: dry-run 对"首选订阅 + 计费 fallback"席提示降级转计费 ----------
+
+def test_dry_run_flags_sub_first_with_billed_fallback(capsys):
+    """F6: cli:codex(订阅,首 try)挂 api fallback → 提示降级会转计费。"""
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "cli", "cli_kind": "codex",
+                        "model": "gpt", "fallback": [{"channel": "api", "model": "m"}]}],
+           "options": {}}
+    moa.dry_run(cfg, "review", "material", "", 0)
+    assert "fallback 含计费通道" in capsys.readouterr().out
+
+
+def test_fallback_has_billed():
+    assert moa._fallback_has_billed(
+        {"channel": "cli", "cli_kind": "codex",
+         "fallback": [{"channel": "api", "model": "m"}]}) is True
+    assert moa._fallback_has_billed({"channel": "subagent", "model": "c"}) is False
+
+
 # ---------- P1-2: refine/discuss 禁止静默回退示例配置 ----------
 
 def test_resolve_config_refuses_example_fallback(tmp_path):
@@ -686,31 +743,53 @@ def test_refine_stats_three_state_and_disputed():
 
 
 def test_refine_stats_sycophancy_alert():
-    # 上一轮多数 = fail(2 fail vs 1 pass)。本轮 b、c 无理由(无 challenge)从 pass 翻向 fail → 谄媚
+    # 上一轮多数 = fail(3 fail vs 1 pass,genuine majority——修 F4 后平票不再当多数派,
+    # 故基准 fixture 必须是真多数)。本轮 d 无理由(无 challenge)从 pass 翻向 fail → 谄媚。
     prior = [_rf("a", "fail", []), _rf("b", "fail", []),
-             _rf("c", "pass", []), _rf("d", "pass", [])]
+             _rf("c", "fail", []), _rf("d", "pass", [])]
     refine = [
         _rf("a", "fail", []),
         _rf("b", "fail", []),
-        _rf("c", "fail", []),   # pass->fail 翻向上一轮多数派 fail,且未提 challenge
-        _rf("d", "fail", []),   # 同上
+        _rf("c", "fail", []),
+        _rf("d", "fail", []),   # pass->fail 翻向上一轮多数派 fail,且未提 challenge
     ]
     s = moa.compute_refine_stats("review", prior, refine)
     assert s["sycophancy_detail"]["prior_majority_verdict"] == "fail"
     assert s["sycophancy_alert"] is True
-    assert s["sycophancy_detail"]["movers"] == 2
-    assert s["sycophancy_detail"]["flips_toward_majority"] == 2
+    assert s["sycophancy_detail"]["movers"] == 1
+    assert s["sycophancy_detail"]["flips_toward_majority"] == 1
 
 
 def test_refine_stats_challenge_is_not_sycophancy():
-    # b 翻向多数,但提出了 challenge(有新证据代理)→ 不算谄媚
-    prior = [_rf("a", "fail", []), _rf("b", "pass", [])]
+    # b 翻向多数(fail),但提出了 challenge(有新证据代理)→ 不算谄媚。
+    # prior 用真多数(2 fail vs 1 pass),使"challenge 豁免"路径而非平票 None 成为判否的原因。
+    prior = [_rf("a", "fail", []), _rf("b", "pass", []), _rf("c", "fail", [])]
     refine = [
         _rf("a", "fail", []),
         _rf("b", "fail", [{"ref_title": "X", "stance": "challenge", "reason": "r"}]),
+        _rf("c", "fail", []),
     ]
     s = moa.compute_refine_stats("review", prior, refine)
+    assert s["sycophancy_detail"]["prior_majority_verdict"] == "fail"
     assert s["sycophancy_alert"] is False
+
+
+def test_majority_verdict_tie_returns_none():
+    """修 F4: 最高票并列 → None(无多数派),不让 dict 插入序决定基准;清晰多数正常返回。"""
+    assert moa._majority_verdict([_rf("a", "fail", []), _rf("b", "pass", [])], "verdict") is None
+    assert moa._majority_verdict(
+        [_rf("a", "fail", []), _rf("b", "fail", []), _rf("c", "pass", [])], "verdict") == "fail"
+    assert moa._majority_verdict([], "verdict") is None
+
+
+def test_refine_stats_no_early_stop_when_seat_failed():
+    """修 F3: 本轮有席位失败 → 即便成功席 verdict 全一致也不建议早停(证据不全,幸存者偏差)。"""
+    prior = [_rf("a", "fail", []), _rf("b", "fail", [])]
+    refine = [_rf("a", "fail", []),
+              {"name": "b", "seat": "A", "parsed": None, "err_class": "server", "error": "x"}]
+    s = moa.compute_refine_stats("review", prior, refine)
+    assert s["round_members_failed"] == 1
+    assert s["early_stop_suggested"] is False      # 全一致但有失败席 → 不早停
 
 
 def test_refine_stats_early_stop_when_consensus():

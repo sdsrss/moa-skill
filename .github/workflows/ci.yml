@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # F1-a: 测试 + leak-check + 徽章防漂移。测试无网络依赖(HTTP/CLI 全 monkeypatch),CI 免 key 可跑。
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.12']   # 锁 README/moa.py 声明的 3.9 下界 + 一个新版
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install deps
+        run: pip install pyyaml pytest
+      - name: Run tests
+        run: python -m pytest skills/moa/tests/ -q
+      - name: leak-check (expect clean, exit 0)
+        run: python skills/moa/scripts/moa.py leak-check
+      # F1-c: 测试徽章防漂移——README 的 "tests-N passing" 必须 == 实际收集到的用例数。
+      - name: Test-count badge matches suite
+        if: matrix.python == '3.12'
+        run: |
+          # 只数以测试路径开头的收集行(防未来 collection-time warning 的 file::nodeid 位置行被误计)
+          collected=$(python -m pytest skills/moa/tests/ --collect-only -q 2>/dev/null | grep -cE '^skills/moa/tests/.*::')
+          for r in README.md README.zh-CN.md; do
+            badge=$(grep -oE 'tests-[0-9]+%20passing' "$r" | grep -oE '[0-9]+' | head -1)
+            if [ "$badge" != "$collected" ]; then
+              echo "::error file=$r::test badge = $badge but suite collects $collected — run bump or update badge" >&2
+              exit 1
+            fi
+            echo "[badge] $r test badge == $collected collected"
+          done
+
+  # F1-b: tag 发版时校验六处版本一致(bump-version.sh --check)且 = tag 名。
+  version-check:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Manifests internally consistent
+        run: bash scripts/bump-version.sh --check
+      - name: plugin.json version == tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          plugin=$(python -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+          if [ "$tag" != "$plugin" ]; then
+            echo "::error::tag v$tag != plugin.json $plugin" >&2
+            exit 1
+          fi
+          echo "[version] tag v$tag == plugin.json $plugin"

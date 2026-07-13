@@ -70,18 +70,20 @@ members:
     fallback:
       - {channel: api, protocol: openrouter, model: google/gemini-3.1-pro-preview}
 
-  - name: adversarial-d        # D 席: 用户体验/反方红队
+  - name: adversarial-d        # D 席: 用户体验/反方红队(第四家族 Moonshot = 真·跨模型去相关)
     seat: D
-    channel: subagent          # CH1: 再派一个 Claude Opus 4.8 子代理扮演反方角色(默认 role=user_advocate)。
-    model: claude-opus-4-8     # 与 B 同模型、不同角色 = 主动 Self-MoA:角色分化即出多样性(§9.2),
-                               # 且走订阅不计费、省 token。纯 subagent(无 api fallback)→ moa.py 跳过,
-                               # 由仲裁人 Task 外派发(加了 api fallback 反而会让脚本走计费 API,失去省 token 意义)。
-    # ↑ 想要第四家族真·跨模型去相关时,把上面 channel/model 两行换成(v1.4.0 推荐,替代旧 grok 方案
-    #   ——grok 需另备有 x-ai 供给的 key,多数 key list-only 404;kimi 走 auggie 一个账号就有):
-    #     channel: cli
-    #     cli_kind: auggie
-    #     model: kimi-k2.7          # Moonshot 家族,2026-07-13 实测 41.8s/4.6KB 可用
-    #   注意: kimi 并发下曾触发 Augment 503 重试挂死(单跑正常),timeout_seconds 兜底必设。
+    channel: cli               # v1.5.0 默认改为第四家族(修审核 §7:B/D+仲裁人原为 3/5 同 Anthropic 家族,
+    cli_kind: auggie           # 全员一致的独立性弱于表面;kimi 走 auggie 一个账号就有,不需额外 key)。
+    model: kimi-k2.7           # auggie 侧模型 ID;Moonshot 家族,2026-07-13 实测 41.8s/4.6KB 可用。
+    timeout_seconds: 240       # kimi 并发下曾触发 Augment 503 内部重试挂死(单跑正常),硬超时必设。
+    fallback:
+      # 无 auggie 的环境: 降级 codex(订阅;model 置空用 codex 默认 GPT——失第四家族多样性但保有一席)。
+      - {channel: cli, cli_kind: codex, model: null}
+    # ↑ 想回到 v1.4.0 之前的省 token 组合(D = 第二个 Opus 子代理做 Self-MoA:走订阅不计费,
+    #   只有角色分化、无跨模型去相关收益)时,把上面 channel..fallback 四行换成:
+    #     channel: subagent
+    #     model: claude-opus-4-8
+    #   (纯 subagent 由仲裁人 Task 外派发;别挂 api fallback,否则 moa.py 判可派发、走计费 API。)
 
 # 仲裁人 = 当前 agent(带完整上下文),不在此配置,不走外部调用。
 
