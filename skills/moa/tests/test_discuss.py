@@ -145,3 +145,50 @@ def test_dissent_preserved_reports_final_positions():
     holds = {d["seat"]: d for d in st["dissent_preserved"]}
     assert holds["A"]["still_holding"] == "无盐是 blocker"
     assert holds["B"]["open_rebuttals"] == ["内网低危可暂缓"]
+
+
+# ---------- ISSUE-004 / DEC-001: discuss 要求 seat 唯一(匿名发言者身份) ----------
+
+def test_require_unique_seats_rejects_duplicate():
+    """两 member 同 seat → discuss 入口 fail-fast(seat 是委员匿名发言者身份,重复会静默丢席/歧义)。"""
+    import pytest
+    cfg = {"members": [{"name": "alpha", "seat": "A"}, {"name": "beta", "seat": "A"}]}
+    with pytest.raises(SystemExit) as ei:
+        moa._require_unique_seats(cfg, "discuss-turn")
+    msg = str(ei.value)
+    assert "seat" in msg and "alpha" in msg and "beta" in msg
+
+
+def test_require_unique_seats_accepts_distinct():
+    """seat 互异 → 放行。"""
+    moa._require_unique_seats(
+        {"members": [{"name": "a", "seat": "A"}, {"name": "b", "seat": "B"},
+                     {"name": "c", "seat": "C"}]}, "discuss-turn")
+
+
+def test_require_unique_seats_rejects_both_missing_seat():
+    """两席都省略 seat(都=?) 也算冲突——讨论必须能区分发言者。"""
+    import pytest
+    with pytest.raises(SystemExit):
+        moa._require_unique_seats({"members": [{"name": "a"}, {"name": "b"}]}, "discuss-prompt")
+
+
+def test_blindvote_overwrite_guard_blocks_cross_name_collision(tmp_path):
+    """纵深防御:同 seat 但别的 name 的盲投已落盘 → 拒覆盖(避免静默丢席);同名允许幂等重写。"""
+    import json, pytest, types
+    # 预置 seat A 的盲投(name=alpha)
+    (tmp_path / "blindvote_A.json").write_text(
+        json.dumps({"seat": "A", "name": "alpha", "vote": {"final_stance": "x"}}), encoding="utf-8")
+    brief = tmp_path / "b.md"; brief.write_text("材料", encoding="utf-8")
+    inj = tmp_path / "inj.json"; inj.write_text('{"final_stance":"y","confidence":0.5,"key_reason":"r"}', encoding="utf-8")
+    cfg = {"members": [{"name": "beta", "seat": "A", "channel": "subagent", "model": "m"}],
+           "options": {"max_tokens_member": 100, "timeout_seconds": 5, "min_successful_members": 1}}
+    args = types.SimpleNamespace(input=str(brief), member="beta", mode="decide",
+                                 collect_dir=str(tmp_path), inject=str(inj))
+    # beta 同为 seat A → 异名冲突,拒写(不覆盖 alpha 的盲投)
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_discuss_blindvote(args, cfg)
+    assert "alpha" in str(ei.value) and "beta" in str(ei.value)
+    # 原文件未被动
+    prev = json.loads((tmp_path / "blindvote_A.json").read_text(encoding="utf-8"))
+    assert prev["name"] == "alpha"

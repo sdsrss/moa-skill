@@ -1548,6 +1548,27 @@ def _inject_result(member, mode, parsed) -> dict:
     }
 
 
+def _require_unique_seats(cfg, phase):
+    """开会讨论要求委员会级 seat 唯一(修 ISSUE-004 / DEC-001)。seat 在 discuss 是委员的【匿名发言者
+    身份】,承担三重角色,任一都因重复 seat 静默损坏:
+      ① 委员互引:responses.to / preamble 都按「委员X」引用,两个「委员A」→ 指代歧义,讨论逻辑坏;
+      ② 转录署名:_speaker_label = 委员{seat}({role}),两个「委员A」无法区分;
+      ③ 聚合键:blindvote_<seat>.json 覆盖、compute_discuss_stats 的 last_by_seat/bv_by_seat/participants
+         按 seat 归并 → 一席从 drift/dissent 静默消失。
+    generate/refine 不需此约束(产物按【唯一的 name】落盘,重复 seat = 合法多角色,如两个可行性质疑席),
+    故只在 discuss 入口 fail-fast,不进 validate_config(否则误伤合法的生成轮配置)。cfg 持有全部 member,
+    首个 discuss 命令即能在花任何 token 前止损。"""
+    seen = {}
+    for m in cfg.get("members", []) or []:
+        seat = m.get("seat", "?")
+        if seat in seen:
+            sys.exit(f"[{phase}] 开会讨论要求 seat 唯一——它是委员的匿名发言者身份(转录署名 / 委员互引「委员X」/ "
+                     f"盲投与 stats 都按 seat 聚合)。members {seen[seat]!r} 与 {m.get('name')!r} 同为 seat {seat!r};"
+                     f"请改成唯一 seat,或用【讨论专用子配置】(只放要参与本场讨论、seat 互异的席)。"
+                     f"注:重复 seat 在 generate/refine 是合法的(按 name 落盘),仅 discuss 要求唯一。")
+        seen[seat] = m.get("name")
+
+
 def _one_member(cfg, member_filter, what):
     members = _select_members(cfg, member_filter)
     if len(members) != 1:
@@ -1563,6 +1584,7 @@ def cmd_discuss_turn(args, cfg):
         warn_sensitive_material(material)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
+    _require_unique_seats(cfg, "discuss-turn")
     m = _one_member(cfg, args.member, "discuss-turn")
     collect = Path(args.collect_dir)
     collect.mkdir(parents=True, exist_ok=True)
@@ -1585,6 +1607,7 @@ def cmd_discuss_prompt(args, cfg):
     """打印某席本回合(或盲投,--blind)的 system/user 精确 prompt,供仲裁人给 CH1 子代理用同一提示词。"""
     material = _read_input(args.input)
     custom_roles = cfg.get("custom_roles", {}) or {}
+    _require_unique_seats(cfg, "discuss-prompt")
     m = _one_member(cfg, args.member, "discuss-prompt")
     transcript_str = format_transcript(load_transcript(Path(args.collect_dir)))
     system, user = discuss_prompt(m, args.mode, material, transcript_str, args.round, custom_roles, blind=args.blind)
@@ -1596,6 +1619,7 @@ def cmd_discuss_blindvote(args, cfg):
     material = _read_input(args.input)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
+    _require_unique_seats(cfg, "discuss-blindvote")
     m = _one_member(cfg, args.member, "discuss-blindvote")
     collect = Path(args.collect_dir)
     collect.mkdir(parents=True, exist_ok=True)
@@ -1611,6 +1635,16 @@ def cmd_discuss_blindvote(args, cfg):
           "vote": res.get("parsed"), "usage": res.get("usage"),
           "error": res.get("error"), "err_class": res.get("err_class")}
     out = collect / f"blindvote_{_safe_name(str(res.get('seat')))}.json"  # 修 N4: seat 也过路径穿越门
+    # 纵深防御(ISSUE-004): 即便绕过入口 seat 唯一门,落盘前再核对——若该 seat 的盲投已被【别的 name】占用,
+    # 覆盖会静默丢一席。同名(重跑同一席)允许幂等覆盖;异名同 seat = 冲突,拒写。
+    if out.exists():
+        try:
+            prev = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prev = None
+        if isinstance(prev, dict) and prev.get("name") and prev.get("name") != res.get("name"):
+            sys.exit(f"[discuss-blindvote] seat {res.get('seat')!r} 的盲投已由 {prev.get('name')!r} 占用,"
+                     f"当前席 {res.get('name')!r} 会覆盖它(seat 冲突,静默丢席)。请改用唯一 seat。")
     out.write_text(json.dumps(bv, ensure_ascii=False, indent=1), encoding="utf-8")
     status = "OK" if res["parsed"] else f"FAIL[{res['err_class']}]"
     print(f"[blindvote] {m['name']} ({res['role']}): {status} -> {out}", file=sys.stderr)
