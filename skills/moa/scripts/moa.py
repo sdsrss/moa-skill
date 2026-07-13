@@ -1266,6 +1266,13 @@ def validate_config(cfg):
         # 化的 "150")会裸 TypeError 中止整轮; 负值(如手误 -5)使窗立即过期→本想"保住慢席"却静默
         # 反把它秒弃。未设(None)= 用默认, 合法。bool 是 int 子类但语义非秒数, 一并拒。
         return v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0)
+
+    def _bad_pos(v):
+        # timeout_seconds / max_tokens_member 进 subprocess/socket timeout 与 API max_tokens、并在
+        # 截断重试里做 `cur_max * 2` / `min(cur_max, CEIL)` 算术与比较: YAML 手误引号化(如 "5")会裸
+        # TypeError(min_successful_members 甚至整轮崩栈),0 或负值语义上也无效(0 超时=立即失败)。
+        # 未设(None)= 用默认, 合法。bool 一并拒。与 grace 的 _bad_grace 同源, 只是要求【正数】而非非负。
+        return v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0)
     if not isinstance(cfg, dict):
         sys.exit("[config] 顶层必须是 YAML 映射(dict);参照 assets/config.example.yaml")
     members = cfg.get("members")
@@ -1292,6 +1299,9 @@ def validate_config(cfg):
         if _bad_grace(m.get("grace_seconds")):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) grace_seconds="
                      f"{m.get('grace_seconds')!r} 非法(应为非负数值秒数,如 150 或 90.0)")
+        if _bad_pos(m.get("timeout_seconds")):
+            sys.exit(f"[config] members[{i}] ({m.get('name')}) timeout_seconds="
+                     f"{m.get('timeout_seconds')!r} 非法(应为正数值秒数,如 240)")
         names.append(m["name"])
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
@@ -1312,6 +1322,17 @@ def validate_config(cfg):
     if _bad_grace(opts.get("grace_seconds")):
         sys.exit(f"[config] options.grace_seconds={opts.get('grace_seconds')!r} "
                  f"非法(应为非负数值秒数,如 90)")
+    # 同源(修 ISSUE-003): 兄弟数值选项同样进算术/比较,手误引号化会裸 TypeError(min_successful_members
+    # 甚至整轮崩栈)。min_successful_members 允许 0(=不设下限);timeout/max_tokens 要求正数。
+    if _bad_grace(opts.get("min_successful_members")):
+        sys.exit(f"[config] options.min_successful_members={opts.get('min_successful_members')!r} "
+                 f"非法(应为非负整数,如 2;0=不设成功下限)")
+    if _bad_pos(opts.get("timeout_seconds")):
+        sys.exit(f"[config] options.timeout_seconds={opts.get('timeout_seconds')!r} "
+                 f"非法(应为正数值秒数,如 180)")
+    if _bad_pos(opts.get("max_tokens_member")):
+        sys.exit(f"[config] options.max_tokens_member={opts.get('max_tokens_member')!r} "
+                 f"非法(应为正整数,如 3000)")
 
 
 # ---------- custom 模式: --members/--models 命令行入口 ----------

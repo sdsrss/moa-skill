@@ -288,10 +288,27 @@ def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     {"members": [{"name": "x", "grace_seconds": True}], "options": {}},   # 按席 bool(非秒数语义)
     {"members": [{"name": "x"}], "options": {"grace_seconds": "90"}},     # 全局 非数值
     {"members": [{"name": "x"}], "options": {"grace_seconds": -1}},       # 全局 负值
+    # 数值型选项校验(ISSUE-003): 与 grace 同源,手误引号化/非法值会裸 TypeError
+    {"members": [{"name": "x"}], "options": {"min_successful_members": "2"}},  # 全局 非数值(会整轮崩栈)
+    {"members": [{"name": "x"}], "options": {"min_successful_members": -1}},   # 负值
+    {"members": [{"name": "x"}], "options": {"timeout_seconds": "180"}},       # 全局 非数值
+    {"members": [{"name": "x"}], "options": {"timeout_seconds": 0}},           # 0 超时=立即失败,无效
+    {"members": [{"name": "x"}], "options": {"max_tokens_member": "3000"}},    # 非数值
+    {"members": [{"name": "x"}], "options": {"max_tokens_member": 0}},         # 0 token 无效
+    {"members": [{"name": "x", "timeout_seconds": "5"}], "options": {}},       # 按席 timeout 非数值
+    {"members": [{"name": "x", "timeout_seconds": -5}], "options": {}},        # 按席 timeout 负值
 ])
 def test_validate_config_rejects_broken(cfg):
     with pytest.raises(SystemExit):
         moa.validate_config(cfg)
+
+
+def test_validate_config_accepts_valid_numeric_options():
+    """数值选项合法值: 未设 / 正数 / min_successful_members=0 均放行(ISSUE-003)。"""
+    moa.validate_config({"members": [{"name": "a", "timeout_seconds": 240},   # 按席正数
+                                     {"name": "b"}],                          # 未设 = 用默认
+                         "options": {"min_successful_members": 0,             # 0 = 不设下限, 合法
+                                     "timeout_seconds": 180, "max_tokens_member": 3000.0}})
 
 
 def test_validate_config_accepts_valid():
