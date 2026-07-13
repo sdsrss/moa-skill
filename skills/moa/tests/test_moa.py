@@ -128,13 +128,17 @@ def test_resolve_channel_api():
     assert [t[0] for t in tries] == ["api"]
 
 
-def test_resolve_channel_cli_with_api_fallback():
+def test_resolve_channel_cli_with_api_fallback(monkeypatch):
+    """裸 channel:cli 默认 cli_kind=auto: 检测到 auggie 则展开为 auggie→codex 两个 try,
+    再接 api fallback(v1.4.0 契约;显式 cli_kind 单 try 见 test_auggie_channel.py)。"""
+    monkeypatch.setattr(moa, "_which", lambda e: f"/usr/bin/{e}")   # 两个二进制都在,密封环境差异
     m = {"name": "x", "channel": "cli", "model": "gpt",
          "fallback": [{"channel": "api", "protocol": "openrouter", "model": "openai/gpt"}]}
-    kinds = [t[0] for t in moa.resolve_channel(m)]
-    assert kinds == ["cli", "api"]
+    tries = moa.resolve_channel(m)
+    assert [t[0] for t in tries] == ["cli", "cli", "api"]
+    assert [t[1].get("cli_kind") for t in tries[:2]] == ["auggie", "codex"]
     # fallback 合并了 member 基础字段
-    _, cfg, note = moa.resolve_channel(m)[1]
+    _, cfg, note = tries[2]
     assert cfg["model"] == "openai/gpt" and "fallback" in note
 
 
@@ -157,16 +161,20 @@ def test_has_dispatchable_channel():
         {"channel": "subagent", "fallback": [{"channel": "api"}]})
 
 
-def test_effective_billing_matches_actual_run():
+def test_effective_billing_matches_actual_run(monkeypatch):
     """dry-run 计费判定须与 moa.py 真正会跑的通道一致(回归 dry-run 少报 bug):
-    旧逻辑只看主通道,把'subagent + api fallback'误记为免费订阅,而 generate 实际走计费 API。"""
+    旧逻辑只看主通道,把'subagent + api fallback'误记为免费订阅,而 generate 实际走计费 API。
+    v1.4.0: auggie 计费(上游价+40%)记 billed;本例钉住"只有 codex 在 PATH"以密封环境差异,
+    auggie 在场的计费判定见 test_auggie_channel.py。"""
+    monkeypatch.setattr(moa, "_which",
+                        lambda e: "/usr/bin/codex" if e == "codex" else None)
     # 纯 subagent(无 api/cli fallback)= 仲裁人免费派发
     assert moa._effective_billing({"channel": "subagent", "model": "claude"}) == "sub"
     # subagent + api fallback = 脚本实跑计费 API(旧逻辑误记为免费,回归点)
     assert moa._effective_billing(
         {"channel": "subagent", "model": "claude",
          "fallback": [{"channel": "api", "model": "anthropic/claude"}]}) == "billed"
-    # subagent + cli fallback = 订阅(codex 也免费)
+    # subagent + cli fallback(实解析为 codex)= 订阅免费
     assert moa._effective_billing(
         {"channel": "subagent", "model": "c",
          "fallback": [{"channel": "cli", "model": "gpt"}]}) == "sub"
@@ -180,12 +188,13 @@ def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     回归:_dispatch_channels 曾用 ccfg['model'] 硬取键,codex 成功后崩在结果构造上。"""
     monkeypatch.setattr(moa, "call_cli_codex",
                         lambda ccfg, system, user, timeout: ('{"verdict":"pass"}', {"verdict": "pass"}))
-    member = {"name": "skeptic-a", "seat": "A", "channel": "cli", "protocol": "codex"}  # 无 model
+    member = {"name": "skeptic-a", "seat": "A", "channel": "cli", "cli_kind": "codex",
+              "protocol": "codex"}            # 无 model;显式 codex(密封 auto 的环境探测)
     opts = {"timeout_seconds": 60, "max_tokens_member": 100}
     res = moa._dispatch_channels(member, "feasibility_skeptic", "sys", "usr", opts)
     assert res["parsed"] == {"verdict": "pass"}
     assert res["model_used"] is None          # 省 model → None,非崩溃
-    assert res["channel_used"] == "cli"
+    assert res["channel_used"] == "cli:codex"  # v1.4.0: 标注实走 kind
     assert res["err_class"] is None
 
 

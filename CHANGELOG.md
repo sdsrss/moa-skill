@@ -3,6 +3,47 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.4.0] — 2026-07-13
+
+> **Migration note**: bare `channel: cli` now means `cli_kind: auto` — when the `auggie` binary is
+> on PATH it is preferred over codex (a one-time stderr banner announces this). In auto mode the
+> auggie try does NOT inherit `cli_extra` (codex-specific flags) and takes its model only from
+> `auggie_model`. **Opt-out / revert**: set `cli_kind: codex` on the member to get the exact
+> pre-1.4.0 behavior. Also note auggie is a *billed* channel (upstream API price +40% via your
+> Augment plan) — `dry-run` now counts it as `billed`, not subscription.
+
+### Added
+- **CH2 second CLI kind: auggie** (`cli_kind: auggie|codex|auto`, default auto → auggie preferred
+  when detected; user decision 2026-07-13, benchmark: mem #10216). One auggie account serves all
+  committee families (GPT/Gemini/Claude/Kimi/GLM). Hardening baked in: prompt via
+  `--instruction-file` (not argv — ARG_MAX/injection, mirrors codex stdin), empty
+  `--workspace-root` sandbox (prevents indexing the real project and codebase-context injection
+  into blind review), `--output-format json` envelope (plain-text mode appends a `Request ID:`
+  trailer that pollutes output), `--max-turns 1`, `--dont-save-session`, `--retry-timeout`
+  (measured: concurrent Augment 503 retries hung >7 min without it; subprocess timeout remains
+  the hard stop).
+- **CLI-path JSON repair round**: cli seats (codex and auggie) now get one self-repair call on
+  unparseable output before falling to the next channel, matching the api path (measured: 2 of 5
+  benchmark runs emitted unescaped quotes inside JSON string values).
+- `channel_used` now records the concrete kind (`cli:auggie` / `cli:codex`).
+- Default committee (config.example.yaml): seats A (gpt5.6-sol) and C (gemini-3.1-pro-preview)
+  move to auggie with codex/api fallbacks; 4th-family alternative comment switches from grok
+  (needs a separate x-ai-supplied key, mostly list-only 404) to auggie `kimi-k2.7`
+  (measured 41.8s/4.6KB).
+
+### Fixed
+- **Reasoning-model truncation on the api path** (the OpenRouter gemini 1KB-empty-shell bug):
+  reasoning models (gemini-3.1-pro, gpt-5.6-sol) can burn the whole `max_tokens` budget on
+  reasoning, returning an empty/truncated `content` with `finish_reason=length`. The old retry
+  re-sent the identical request — deterministic re-failure. `call_model` now doubles the budget
+  on each such retry (capped at 16000) and, if the final attempt still truncates with partial
+  content, returns it best-effort for the parse/repair layer to salvage.
+
+### Tests
+- 137 → 162 (auggie channel: command shape / error classification / envelope + Request-ID
+  fallback; cli_kind resolution incl. auto detection order; billing; cli repair round;
+  truncation budget escalation ladder). Legacy cli tests pinned hermetic (`_which` stubbed).
+
 ## [1.3.3] — 2026-07-12
 
 Fixes from a full second-pass audit of v1.3.2 (report: `docs/audit-report-2026-07-12-v1.3.2.md`).

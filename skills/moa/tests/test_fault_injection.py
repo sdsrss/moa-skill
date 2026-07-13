@@ -218,6 +218,64 @@ def test_dispatch_channels_all_fail_returns_last_failure(monkeypatch):
     assert res["parsed"] is None and res["err_class"] == "client"
 
 
+# ---------- 行为 4: 推理模型截断 → 重试倍增 max_tokens(修 OpenRouter gemini 空壳 bug) ----------
+# 实测(2026-07,mem #10112/#10216): gemini-3.1-pro / gpt-5.6-sol 在 max_tokens 偏小时
+# reasoning 吃光额度,content 返空壳且 finish_reason=length。旧代码按"空响应"原样重试
+# (同 max_tokens)→ 确定性再失败,重试全浪费。修复:检测到截断,重试时倍增预算。
+
+def test_truncated_empty_shell_retries_with_doubled_budget(monkeypatch):
+    monkeypatch.setattr(moa.time, "sleep", lambda s: None)
+    monkeypatch.setattr(moa, "endpoint_and_headers", lambda cfg: ("http://x", {}))
+    budgets = []
+
+    def reasoning_eats_budget(url, headers, payload, timeout):
+        budgets.append(payload["max_tokens"])
+        if payload["max_tokens"] < 6000:               # 预算不足 → 空壳
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        return {"choices": [{"message": {"content": '{"verdict":"pass"}'},
+                             "finish_reason": "stop"}],
+                "usage": {"total_tokens": 9}}
+
+    monkeypatch.setattr(moa, "http_post", reasoning_eats_budget)
+    content, usage = moa.call_model({"model": "m"}, "s", "u", 0.3, 3000, 30)
+    assert budgets == [3000, 6000]                     # 空壳后预算倍增,而非原样重试
+    assert '"verdict"' in content
+
+
+def test_truncation_budget_capped_at_ceiling(monkeypatch):
+    monkeypatch.setattr(moa.time, "sleep", lambda s: None)
+    monkeypatch.setattr(moa, "endpoint_and_headers", lambda cfg: ("http://x", {}))
+    budgets = []
+
+    def always_empty_shell(url, headers, payload, timeout):
+        budgets.append(payload["max_tokens"])
+        return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+
+    monkeypatch.setattr(moa, "http_post", always_empty_shell)
+    with pytest.raises(moa.TransientError):
+        moa.call_model({"model": "m"}, "s", "u", 0.3, 12000, 30)
+    assert budgets == [12000, 16000, 16000]            # 封顶 _MAX_TOKENS_CEILING,不无限膨胀
+
+
+def test_truncated_with_partial_content_returns_best_effort_on_last_attempt(monkeypatch):
+    """所有重试后仍 finish_reason=length 但 content 非空 → 尽力返回(交给 parse/修复轮抢救),
+    而非丢弃该席——旧行为直接返回首跑截断文本,新行为先重试大预算再兜底。"""
+    monkeypatch.setattr(moa.time, "sleep", lambda s: None)
+    monkeypatch.setattr(moa, "endpoint_and_headers", lambda cfg: ("http://x", {}))
+    calls = {"n": 0}
+
+    def always_truncated(url, headers, payload, timeout):
+        calls["n"] += 1
+        return {"choices": [{"message": {"content": '{"verdict":"pa'},
+                             "finish_reason": "length"}],
+                "usage": {"total_tokens": 5}}
+
+    monkeypatch.setattr(moa, "http_post", always_truncated)
+    content, usage = moa.call_model({"model": "m"}, "s", "u", 0.3, 3000, 30)
+    assert calls["n"] == 3                             # 重试仍给满(首跑+2)
+    assert content == '{"verdict":"pa'                 # 末次尽力返回截断内容
+
+
 # ---------- 传输层: http_post 请求构造 + 响应解析(此前 0 覆盖,总被 stub 掉) ----------
 
 def test_http_post_builds_post_request_and_parses_json(monkeypatch):

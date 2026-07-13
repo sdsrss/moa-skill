@@ -43,3 +43,6 @@ moa-reports/**/stats*.json
 moa-reports/**/discussion.jsonl
 moa-reports/**/blindvote_*.json
 moa-reports/**/discuss_stats.json
+
+# ── 任务规格工作档(不随仓库发布,同 docs/ 约定)──
+tasks/

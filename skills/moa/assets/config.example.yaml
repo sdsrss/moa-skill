@@ -2,8 +2,17 @@
 #
 # 通道(channel,design.md §4.2):
 #   api      CH3。openrouter(默认,一个 OPENROUTER_API_KEY 调所有厂商) / openai(兼容端点,可自带 base_url/api_key_env)。
-#   cli      CH2。codex exec 非交互(prompt 走 stdin、-s read-only、--output-last-message 取 JSON、
-#            --skip-git-repo-check、--ephemeral)。走 codex 自身鉴权,不需 key。model 用 codex 侧 ID。
+#   cli      CH2。两种 cli_kind(v1.4.0):
+#              auggie  auggie --print 非交互(--output-format json 信封取 result、--instruction-file、
+#                      空 workspace 防索引注入、--max-turns 1)。走 auggie 自身 OAuth,不需 key;
+#                      一个账号覆盖 GPT/Gemini/Claude/Kimi/GLM 全家族(auggie models list 查 ID)。
+#                      计费: Augment 按上游 API 价 +40% 结算(dry-run 记 billed,非订阅免费)。
+#              codex   codex exec 非交互(prompt 走 stdin、-s read-only、--output-last-message 取 JSON、
+#                      --skip-git-repo-check、--ephemeral)。走 codex 自身鉴权,不需 key。model 用 codex 侧 ID。
+#              cli_kind 省略 = auto: 检测到 auggie 二进制即优先走 auggie(2026-07 实测更稳:无头 codex
+#                      曾超时、gemini CLI 需另行认证),codex 殿后。auto 下 auggie 不继承 cli_extra
+#                      (codex 专属 flag 语义不同),模型只取 auggie_model;要精确控制就显式写 cli_kind。
+#                      回退旧行为(opt-out): 该席显式设 cli_kind: codex。
 #   subagent CH1。仲裁人用 Task 机制脚本外派发(可指定非会话默认模型),产物写入同一 collect-dir。
 #            moa.py 遇到此通道会跳过(留给仲裁人)。
 #
@@ -35,12 +44,14 @@
 members:
   - name: reasoning-a          # A 席: 选它做逻辑推理/方案权衡(review 角色=可行性质疑者)
     seat: A
-    channel: cli               # codex 走订阅,省钱
-    # model 省略 → 用 codex 默认(GPT-5 级);codex(ChatGPT 账号)不接受显式 -m,给了会 400。
-    # codex_bin: codex         # 可选:codex 可执行文件名/路径,默认 "codex"(不在 PATH 或改名时才需设)
-    cli_extra: ["-c", "model_reasoning_effort=high"]
+    channel: cli
+    cli_kind: auggie           # 2026-07-13 实测: gpt5.6-sol 并发 42.1s/7.2KB 完整返回
+    model: gpt5.6-sol          # auggie 侧模型 ID(auggie models list 查;≠ OpenRouter 的 openai/gpt-5.6-sol)
+    # auggie_bin: auggie       # 可选:可执行文件名/路径,默认 "auggie"
     timeout_seconds: 240
     fallback:
+      # codex 兜底: model 必须置空——codex(ChatGPT 账号)不接受显式 -m,继承 auggie 模型 ID 会 400
+      - {channel: cli, cli_kind: codex, model: null, cli_extra: ["-c", "model_reasoning_effort=high"]}
       - {channel: api, protocol: openrouter, model: openai/gpt-5.6-sol}   # ✔ 2026-07-12 实测 http200
 
   - name: coding-b             # B 席: 代码理解/工程实现
@@ -52,10 +63,12 @@ members:
 
   - name: fact-c               # C 席: 事实核查(尽量开搜索接地)
     seat: C
-    channel: api
-    protocol: openrouter
-    model: google/gemini-3.1-pro-preview
-    timeout_seconds: 240       # Gemini 系较慢,单独放宽
+    channel: cli
+    cli_kind: auggie           # 2026-07-13 实测: 96.7s/5.4KB 完整;同席走 OpenRouter 曾 1KB 空壳
+    model: gemini-3.1-pro-preview      # (推理吃光 max_tokens;api 通道 v1.4.0 已修但 auggie 更省心)
+    timeout_seconds: 240       # Gemini 系较慢,单独放宽(auggie 并发实测 97s,勿低于 120)
+    fallback:
+      - {channel: api, protocol: openrouter, model: google/gemini-3.1-pro-preview}
 
   - name: adversarial-d        # D 席: 用户体验/反方红队
     seat: D
@@ -63,10 +76,12 @@ members:
     model: claude-opus-4-8     # 与 B 同模型、不同角色 = 主动 Self-MoA:角色分化即出多样性(§9.2),
                                # 且走订阅不计费、省 token。纯 subagent(无 api fallback)→ moa.py 跳过,
                                # 由仲裁人 Task 外派发(加了 api fallback 反而会让脚本走计费 API,失去省 token 意义)。
-    # ↑ 想要 xAI 第四族真·跨模型去相关(需该 key 有 x-ai 供给)时,把上面 channel/model 两行换成:
-    #     channel: api
-    #     protocol: openrouter
-    #     model: x-ai/grok-4.5      # 多数 key 为 list-only 404,先按上文备忘实调核对
+    # ↑ 想要第四家族真·跨模型去相关时,把上面 channel/model 两行换成(v1.4.0 推荐,替代旧 grok 方案
+    #   ——grok 需另备有 x-ai 供给的 key,多数 key list-only 404;kimi 走 auggie 一个账号就有):
+    #     channel: cli
+    #     cli_kind: auggie
+    #     model: kimi-k2.7          # Moonshot 家族,2026-07-13 实测 41.8s/4.6KB 可用
+    #   注意: kimi 并发下曾触发 Augment 503 重试挂死(单跑正常),timeout_seconds 兜底必设。
 
 # 仲裁人 = 当前 agent(带完整上下文),不在此配置,不走外部调用。
 

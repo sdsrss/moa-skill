@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.3.3-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-137%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.4.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-162%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -31,7 +31,7 @@ Built on **Mixture-of-Agents (MoA)**: different models have different blind spot
 
 One model reviewing its own work is one set of blind spots. MoA Skill convenes **up to four independent, heterogeneous models** across the OpenAI / Anthropic / Google / xAI families that never see each other's raw output during generation, then lets **your current agent — holding full context — arbitrate** under hard anti-groupthink rules. You get a second, third, fourth opinion that is *actually independent*, with disagreements surfaced rather than averaged away.
 
-> **On the default roster:** the shipped `config.example.yaml` fields three families — OpenAI (codex) + Anthropic (Opus) + Google (Gemini) — plus a fourth **role-differentiated Self-MoA seat** (a second Anthropic model in an adversarial role). The fourth *family*, xAI/Grok, is opt-in: it needs an OpenRouter key with x-ai supply (many keys return list-only 404 for Grok), so swap it in per the caveats in [`config.example.yaml`](skills/moa/assets/config.example.yaml). Family count is a config choice, not a hard-coded four.
+> **On the default roster (v1.4.0):** the shipped `config.example.yaml` fields three families — OpenAI (gpt5.6-sol via auggie) + Anthropic (Opus subagents) + Google (gemini-3.1-pro via auggie) — plus a fourth **role-differentiated Self-MoA seat** (a second Anthropic model in an adversarial role). The fourth *family* is opt-in and now one comment-block away: swap seat D to `kimi-k2.7` via auggie (Moonshot — same account, no extra key). The older xAI/Grok option needs an OpenRouter key with x-ai supply (most are list-only 404); see the caveats in [`config.example.yaml`](skills/moa/assets/config.example.yaml). Family count is a config choice, not a hard-coded four.
 
 It is a **committee you summon on demand — not an auto-development pipeline.** Coding and fixing stay with your main agent; MoA is for the judgment-dense nodes: review, decision, arbitration, brainstorming.
 
@@ -54,7 +54,8 @@ cp -r moa-skill/skills/moa ~/.claude/skills/moa      # Claude Code auto-discover
 ```bash
 # Runtime dependency either way (the HTTP layer is pure stdlib)
 pip install pyyaml
-# Optional CH2 (local CLI channel): install the codex CLI (0.144+) and log in
+# Optional CH2 (local CLI channel): install auggie (`auggie login`; preferred when detected —
+#   one account serves GPT/Gemini/Claude/Kimi/GLM) and/or the codex CLI (0.144+)
 ```
 
 **Configure API keys via environment variables only** — never written to disk, logs, or reports:
@@ -77,7 +78,7 @@ cp skills/moa/assets/config.example.yaml config.yaml   # then edit models/channe
 | Channel | What | Billing | Dispatched by |
 |---|---|---|---|
 | **CH3 API** | OpenRouter (one key, all providers) / any OpenAI-compatible endpoint | per-token | `moa.py` |
-| **CH2 CLI** | `codex exec` non-interactive (`-s read-only`, prompt via stdin) | codex subscription | `moa.py` |
+| **CH2 CLI** | `cli_kind: auggie` (`auggie --print`, JSON envelope, empty-workspace sandbox; **preferred when detected**, opt out with `cli_kind: codex`) or `codex exec` (`-s read-only`, prompt via stdin) | auggie: upstream price +40% (Augment plan); codex: subscription | `moa.py` |
 | **CH1 Subagent** | Claude subagent (Task tool, can target a non-session model) | subscription | **arbiter (out-of-script)** |
 
 `moa.py` runs CH2/CH3 seats; it skips `channel: subagent` (CH1) seats for the arbiter to dispatch in parallel via the Task tool, writing artifacts into the same `--collect-dir`.
@@ -167,7 +168,7 @@ Sequential speaking, later speakers see earlier turns (an explicit exception to 
 
 ## Cost
 
-Tokens run a few × a single model. Measured (2 billed seats + 1 refine round, on cheap non-reasoning models — see [`COST-NOTE.md`](moa-reports/cost-m4/COST-NOTE.md)) = **4.79× baseline**. The **shipped default puts only seat C on a billed CH3 channel** (A=codex, B & D=subscription subagents), so the user-paid token multiple is lower still. **All-CH3 four seats + refine ≈ 9.6×** (over the 7× target). Always `dry-run` and show the estimate before a real run.
+Tokens run a few × a single model. Measured (2 billed seats + 1 refine round, on cheap non-reasoning models — see [`COST-NOTE.md`](moa-reports/cost-m4/COST-NOTE.md)) = **4.79× baseline**. The **shipped v1.4.0 default bills seats A & C via auggie** (upstream API price +40%, drawn from your Augment plan; B & D stay subscription subagents) — a deliberate stability-over-cost trade after headless codex timeouts and OpenRouter reasoning-model empty shells; set `cli_kind: codex` on A and `channel: api` on C to restore the cheaper pre-1.4.0 mix. **All-CH3 four seats + refine ≈ 9.6×** (over the 7× target). Always `dry-run` and show the estimate before a real run.
 
 ---
 
@@ -200,14 +201,16 @@ Per the MoA paper, aggregators benefit from full context while proposers don't �
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `FAIL[empty]: empty response shell` | Reasoning model spent its budget on reasoning, body empty | Raise `max_tokens_member`, or use a non-reasoning model for that seat |
+| `FAIL[empty]` / `FAIL[truncated]` | Reasoning model spent its budget on reasoning, body empty/cut | v1.4.0 auto-doubles the budget on retry (cap 16000); if it still fails, raise `max_tokens_member` or use a non-reasoning model for that seat |
 | `FAIL[client]: HTTP 404 No allowed providers` | Model has no provider on your OpenRouter account, or the ID is stale | Verify the ID with `dry-run`; switch to a served model; add a fallback seat |
-| Top-tier reasoning model (gpt-5 / gemini-pro) `FAIL[empty]` after a long run | Reasoning ate all of `max_tokens`, body is an empty shell (**false negative** — model is fine) | Raise `max_tokens_member` ≥ 8000 (decide long-output needs more) |
+| Top-tier reasoning model (gpt-5 / gemini-pro) `FAIL[empty]` after a long run | Reasoning ate all of `max_tokens`, body is an empty shell (**false negative** — model is fine) | v1.4.0 retries with a doubled budget automatically; for decide-mode long output still start from `max_tokens_member` ≥ 8000, or move the seat to auggie (manages its own budget) |
 | Model is in the OpenRouter list but calls 404 | list-only: that key has no provider supply | Switch to a key/model actually served; still-404 through the proxy = genuinely unserved, not a proxy issue |
 | `codex ... gpt-5-codex not supported ... ChatGPT account` | codex (ChatGPT account) rejects an explicit `-m gpt-5-codex` | **Omit `model`** on the CH2 seat; use codex's default (GPT-5 tier) |
 | `FAIL: output not parseable` | Model returned non-JSON (some cheap models follow JSON poorly) | Falls through the fallback chain or self-repairs; use a model with better JSON adherence |
 | `[abort] dispatchable members ... ok < required` | Successful **dispatchable** seats (CH2/CH3) < `min(min_successful_members, dispatchable-seat count)` | Check key/quota/model availability; pure-subagent (CH1) seats are arbiter-dispatched and don't count toward this gate |
 | `codex not found on PATH` | CH2 seat but codex not installed | Install codex, switch that seat's `channel` to `api`, or add a fallback |
+| `auggie not found on PATH` | CH2 seat with `cli_kind: auggie` but auggie not installed | Install auggie (`npm i -g @augmentcode/auggie` + `auggie login`), or set the seat to `cli_kind: codex` / `channel: api` |
+| auggie seat hangs until timeout under concurrency | Augment 503 + internal retries (measured: >7 min without a cap) | Keep `timeout_seconds` set (hard stop); the built-in `--retry-timeout` already bounds internal retries |
 | `channel=subagent must be dispatched by arbiter` | CH1 seat with no api/cli fallback — `moa.py` skips it | Dispatch it via the Task tool as arbiter, or give the seat an api fallback |
 | Report numbers disagree with `stats` | Arbiter rewrote consensus / counts from impression | Hard rule: report numbers must match `stats`; if `sycophancy_alert` is true, disclose it and lower confidence |
 
@@ -216,7 +219,7 @@ Per the MoA paper, aggregators benefit from full context while proposers don't �
 ## Development
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 137 cases (behavior + doc-consistency fixtures), no network
+python -m pytest skills/moa/tests/ -q      # 162 cases (behavior + doc-consistency fixtures), no network
 python skills/moa/scripts/moa.py leak-check # static secret-leak self-check: non-zero exit on hit (preview redacted)
 ```
 

@@ -249,22 +249,37 @@ def classify_http_error(e: urllib.error.HTTPError) -> Exception:
                           hint=e.read().decode("utf-8", "replace")[:200] if hasattr(e, "read") else "")
 
 
+# 截断重试的预算封顶: 推理模型空壳时倍增 max_tokens,到此为止不再膨胀(防成本失控)。
+_MAX_TOKENS_CEILING = 16000
+
+
 def call_model(cfg: dict, system: str, user: str, temperature: float,
                max_tokens: int, timeout: int, retries: int = 2) -> tuple[str, dict]:
-    """瞬态错误指数退避重试;永久错误立即抛出。空响应视为瞬态(Gemini 配额耗尽会静默吞 JSON)。"""
+    """瞬态错误指数退避重试;永久错误立即抛出。空响应视为瞬态(Gemini 配额耗尽会静默吞 JSON)。
+    截断修复(mem #10216): 推理模型(gemini-3.1-pro/gpt-5.6-sol)在 max_tokens 偏小时 reasoning
+    吃光额度,content 空壳且 finish_reason=length——原样重试必然复现,故重试时倍增预算
+    (封顶 _MAX_TOKENS_CEILING);末次仍截断但有内容则尽力返回,交上层 parse/修复轮抢救。"""
     url, headers = endpoint_and_headers(cfg)
     last_err = None
+    cur_max = max_tokens
     for attempt in range(retries + 1):
         try:
             data = http_post(url, headers, {
-                "model": cfg["model"], "max_tokens": max_tokens,
+                "model": cfg["model"], "max_tokens": cur_max,
                 "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}]}, timeout)
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            if not content or not content.strip():
-                raise TransientError("empty response shell", err_class="empty")
-            return content, (data.get("usage") or {})
+            choice = (data.get("choices") or [{}])[0]
+            content = choice.get("message", {}).get("content", "") or ""
+            finish = choice.get("finish_reason") or choice.get("native_finish_reason") or ""
+            if content.strip() and finish != "length":
+                return content, (data.get("usage") or {})
+            if content.strip() and attempt == retries:   # 加倍后仍截断: 尽力返回部分内容
+                return content, (data.get("usage") or {})
+            cur_max = min(cur_max * 2, _MAX_TOKENS_CEILING)
+            raise TransientError(
+                f"empty/truncated response (finish_reason={finish or '-'})",
+                err_class="truncated" if finish == "length" else "empty")
         except urllib.error.HTTPError as e:
             err = classify_http_error(e)
             if isinstance(err, PermanentError):
@@ -369,31 +384,124 @@ def _which(exe: str):
     return shutil.which(exe)
 
 
+# ---------- CH2b: auggie CLI 通道 (spec: tasks/specs/auggie-cli-channel.md) ----------
+
+def call_cli_auggie(cfg, system, user, timeout):
+    """auggie --print 非交互调用(0.32.0 实测,mem #10216):
+      - prompt 走 --instruction-file 临时文件,不走 argv(防 ARG_MAX 与注入,对齐 codex stdin)
+      - --workspace-root 指向空临时目录: 防索引真实项目、防代码库检索上下文注入盲审
+      - --output-format json 取 result 字段(纯文本模式尾部会追加 "Request ID: <uuid>" 污染输出)
+      - --max-turns 1 禁 Agent 多轮 / --dont-save-session 不留会话
+      - --retry-timeout 限内部限流重试(并发下 Augment 503 内部重试可挂死,实测 >7min);
+        subprocess timeout 仍是硬兜底
+    计费: Augment 按上游 API 价 +40% 结算,非订阅免费通道(_effective_billing 记 billed)。"""
+    auggie_bin = cfg.get("auggie_bin", "auggie")
+    if not _which(auggie_bin):
+        raise PermanentError(f"{auggie_bin} not found on PATH", err_class="startup",
+                             hint="install auggie, or set member.auggie_bin / cli_kind: codex")
+    prompt = f"{system}\n\n---\n\n{user}\n\n只输出 JSON,不要任何其他文字。"
+    with tempfile.TemporaryDirectory(prefix="moa_auggie_") as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        pf = Path(td) / "prompt.txt"
+        pf.write_text(prompt, encoding="utf-8")
+        cmd = [auggie_bin, "--print", "--quiet", "--output-format", "json",
+               "--max-turns", "1", "--dont-save-session",
+               "--retry-timeout", str(max(30, timeout // 3)),
+               "--workspace-root", str(ws), "--instruction-file", str(pf)]
+        if cfg.get("model"):
+            cmd += ["--model", cfg["model"]]
+        cmd += list(cfg.get("cli_extra", []) or [])
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise TransientError(f"auggie timeout after {timeout}s", err_class="timeout")
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace")[:200]
+            ec = "auth" if re.search(r"login|auth|credential|401|403", err, re.I) else "cli"
+            raise (PermanentError if ec == "auth" else TransientError)(
+                f"auggie exit {proc.returncode}: {err}", err_class=ec)
+        out = proc.stdout.decode("utf-8", "replace")
+        try:
+            env = json.loads(out)
+            if env.get("is_error"):
+                raise TransientError(f"auggie is_error: {str(env.get('result'))[:200]}",
+                                     err_class="cli")
+            text = (env.get("result") or "").strip()
+        except json.JSONDecodeError:  # 信封解析失败(版本差异): 回退纯文本,剥 Request ID 尾行
+            text = re.sub(r"\n+Request ID: [0-9a-fA-F-]+\s*$", "", out).strip()
+        if not text:
+            raise TransientError("auggie empty output shell", err_class="empty")
+        return text, parse_json(text)
+
+
 # ---------- 通道调度 (fallback 链: api / cli 混合;subagent 脚本外) ----------
+
+_auggie_announced = False
+
+
+def _expand_cli(cfg, note):
+    """cli 席按 cli_kind 展开成尝试列表。auto(默认): 检测到 auggie 二进制则优先
+    (稳定、一个账号模型全,2026-07-13 用户指令),codex 殿后;auto 的 auggie try
+    不继承 cli_extra(codex 专属 flag 如 -c,在 auggie 里语义完全不同),模型只取
+    auggie_model(两侧模型 ID 命名空间不同: gpt5.6-sol vs openai/gpt-5.6-sol)。
+    显式 cli_kind: codex/auggie = 完全按成员配置跑(codex 即 auto 的 opt-out 路径)。"""
+    global _auggie_announced
+    kind = cfg.get("cli_kind", "auto")
+    if kind in ("codex", "auggie"):
+        return [("cli", {**cfg, "cli_kind": kind}, note)]
+    tries = []
+    if _which(cfg.get("auggie_bin", "auggie")):
+        if not _auggie_announced:
+            print("[cli] auggie detected → preferred for channel:cli seats "
+                  "(set member.cli_kind: codex to opt out)", file=sys.stderr)
+            _auggie_announced = True
+        tries.append(("cli", {**cfg, "cli_kind": "auggie",
+                              "model": cfg.get("auggie_model"), "cli_extra": []},
+                      (note + "; " if note else "") + "auto→auggie"))
+    if _which(cfg.get("codex_bin", "codex")):
+        tries.append(("cli", {**cfg, "cli_kind": "codex"},
+                      (note + "; " if note else "") + "auto→codex"))
+    if not tries:  # 两个二进制都不在: 仍给 codex try,让 startup 错误浮出而非静默 0 通道
+        tries.append(("cli", {**cfg, "cli_kind": "codex"}, note))
+    return tries
+
 
 def resolve_channel(member: dict):
     """返回按 fallback 链展开的 (kind, cfg, note) 尝试列表。
-    channel=api/cli 直接可跑;channel=subagent 由仲裁人脚本外派发,此处跳过(仅收其 fallback)。"""
+    channel=api/cli 直接可跑;channel=subagent 由仲裁人脚本外派发,此处跳过(仅收其 fallback)。
+    cli 席再按 cli_kind(auto/codex/auggie)展开,见 _expand_cli。"""
     tries = []
     ch = member.get("channel", "api")
-    if ch in ("api", "cli"):
-        tries.append((ch, member, ""))
+    if ch == "api":
+        tries.append(("api", member, ""))
+    elif ch == "cli":
+        tries += _expand_cli(member, "")
     for fb in member.get("fallback", []) or []:
         fch = fb.get("channel", "api")
-        if fch in ("api", "cli"):
-            tries.append((fch, {**member, **fb}, f"fallback from channel={ch}"))
+        merged = {**member, **fb}
+        note = f"fallback from channel={ch}"
+        if fch == "api":
+            tries.append(("api", merged, note))
+        elif fch == "cli":
+            tries += _expand_cli(merged, note)
     return tries
 
 
 def _effective_billing(member) -> str:
-    """dry-run 计费判定:返回 'billed'(CH3 计费) 或 'sub'(订阅/免费,CH1 子代理或 CH2 codex)。
+    """dry-run 计费判定:返回 'billed'(计费) 或 'sub'(订阅/免费)。
     按 moa.py *真正会跑* 的通道判定,而非配置的主通道——纯 subagent(无 api/cli fallback)由仲裁人
-    免费派发;否则脚本跑 resolve_channel 的首个 try(cli=订阅免费, api=计费)。修正旧逻辑只看主通道、
-    把 'subagent + api fallback' 误记为免费的少报 bug(该席位 generate 时实走计费 API)。"""
+    免费派发(sub);否则看 resolve_channel 首个 try: cli:codex=订阅(sub),cli:auggie=Augment 按
+    上游价+40% 计费(billed),api=计费(billed)。修正旧逻辑只看主通道、把 'subagent + api fallback'
+    误记为免费的少报 bug;auggie 若归订阅同样会低估成本。"""
     tries = resolve_channel(member)
     if not tries:
         return "sub"                        # 纯 subagent → 仲裁人免费派发
-    return "sub" if tries[0][0] == "cli" else "billed"
+    kind, ccfg, _ = tries[0]
+    if kind == "cli":
+        return "billed" if ccfg.get("cli_kind") == "auggie" else "sub"
+    return "billed"
 
 
 def _seat_role(member, mode):
@@ -416,19 +524,25 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
     for kind, ccfg, note in tries:
         try:
             if kind == "cli":
-                raw, parsed = call_cli_codex(ccfg, system, user, timeout)
-                usage = None  # 订阅通道(codex)不计费,无 usage 折算
-                if parsed is None:  # cli 输出无法解析,视为瞬态,尝试下一 fallback
-                    raise TransientError("codex output not valid JSON", err_class="parse")
+                ckind = ccfg.get("cli_kind", "codex")
+                fn = call_cli_auggie if ckind == "auggie" else call_cli_codex
+                raw, parsed = fn(ccfg, system, user, timeout)
+                usage = None  # cli 通道无 usage 折算(codex 走订阅;auggie 在 Augment 侧结算)
+                if parsed is None:  # 解析失败先给一次 CLI 修复轮(对齐 api 路径),仍失败才交 fallback
+                    _, parsed = _cli_json_repair(fn, ccfg, raw, timeout)
+                    if parsed is None:
+                        raise TransientError(f"{ckind} output not valid JSON after repair",
+                                             err_class="parse")
             else:
                 raw, parsed, usage = call_with_json_repair(
                     ccfg, system, user, member.get("temperature_generate", default_temp),
                     opts["max_tokens_member"], timeout, None)
+            label = f"cli:{ccfg.get('cli_kind', 'codex')}" if kind == "cli" else kind
             return {
                 "name": member["name"], "seat": seat, "role": role_key,
                 "model_used": ccfg.get("model"),  # codex 席可省 model(用 codex 默认)→ None,非 KeyError
                 "protocol": ccfg.get("protocol", "-" if kind == "cli" else "openrouter"),
-                "channel_used": kind + (f" ({note})" if note else ""),
+                "channel_used": label + (f" ({note})" if note else ""),
                 "raw": raw, "parsed": parsed, "usage": usage, "latency_s": round(time.time() - t0, 1),
                 "error": None if parsed else "output not parseable", "err_class": None,
             }
@@ -440,6 +554,14 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
             last = _fail(member, role_key, f"{e} [{ec}]", ec, t0)
             continue
     return last or _fail(member, role_key, "all channels failed", "unknown", t0)
+
+
+def _cli_json_repair(fn, ccfg, raw, timeout):
+    """cli 路径的一次性 JSON 自修复(与 api 路径 call_with_json_repair 对齐;实测 5 跑 2 跑
+    模型在 JSON 字符串值里写未转义引号,直接把该席丢给 fallback 太浪费——修复轮多为轻推理)。"""
+    return fn(ccfg,
+              "你上一次的输出不是合法 JSON。把其中的实质内容原样转成合法 JSON,不要增删观点,不要解释。",
+              f"你上一次的输出:\n{raw}", timeout)
 
 
 def run_member_generate(member, mode, material, topic, opts, custom_roles):
@@ -1023,8 +1145,8 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
             api_calls_billed += 1
     total_calls_each = (1 + refine_rounds)
     print(f"\n外部委员调用数 = {n} 席 × {total_calls_each}(生成+精炼) = {n * total_calls_each}")
-    print(f"  其中 API 计费通道(CH3): {api_calls_billed} 席 × {total_calls_each} = {api_calls_billed * total_calls_each} 次")
-    print(f"  订阅通道(CH1/CH2): {api_calls_sub} 席 × {total_calls_each} = {api_calls_sub * total_calls_each} 次(只计次数,不折算美元)")
+    print(f"  其中计费通道(CH3 api / CH2 auggie=上游价+40%): {api_calls_billed} 席 × {total_calls_each} = {api_calls_billed * total_calls_each} 次")
+    print(f"  订阅通道(CH1 subagent / CH2 codex): {api_calls_sub} 席 × {total_calls_each} = {api_calls_sub * total_calls_each} 次(只计次数,不折算美元)")
     print("收敛由当前 agent(仲裁人)完成,不计外部调用。")
     print(f"proxy: {'via ' + str(PROXIES) if PROXIES else 'no env proxy, direct'}")
     warn_sensitive_material(material)  # 外发前敏感信息扫描,检出即脱敏告警
@@ -1066,6 +1188,9 @@ def validate_config(cfg):
         ch = m.get("channel", "api")
         if ch not in ("api", "cli", "subagent"):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) channel={ch!r} 非法(应为 api/cli/subagent)")
+        ck = m.get("cli_kind", "auto")
+        if ck not in ("auto", "codex", "auggie"):
+            sys.exit(f"[config] members[{i}] ({m.get('name')}) cli_kind={ck!r} 非法(应为 auto/codex/auggie)")
         names.append(m["name"])
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
