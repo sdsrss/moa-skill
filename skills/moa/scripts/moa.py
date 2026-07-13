@@ -617,7 +617,7 @@ def _speaker_label(turn: dict) -> str:
 
 def format_transcript(turns: list) -> str:
     """把已落盘的回合(turn 非空)按轮次格式化成可见发言记录。空=首位发言者无记录。"""
-    visible = [t for t in turns if t.get("turn")]
+    visible = [t for t in turns if isinstance(t.get("turn"), dict)]  # 非对象回合不入记录(ISSUE-002)
     if not visible:
         return "(你是本轮第一位发言者,暂无此前发言。)"
     by_round = {}
@@ -629,7 +629,7 @@ def format_transcript(turns: list) -> str:
         for t in by_round[rnd]:
             p = t["turn"]
             resp = "; ".join(f"[{r.get('stance')}→{r.get('to')}] {r.get('reason', '')}"
-                             for r in p.get("responses", []))
+                             for r in _dict_items(p.get("responses")))
             lines.append(f"{_speaker_label(t)}: 立场「{p.get('current_stance', '')}」"
                          + (f" | 新论据: {p['new_argument']}" if p.get("new_argument") else "")
                          + (f" | 回应: {resp}" if resp else ""))
@@ -851,6 +851,38 @@ def _parsed_ok(r) -> bool:
     return isinstance(r.get("parsed"), dict)
 
 
+def _dict_items(v) -> list:
+    """把 schema 里「对象数组」字段(issues/opponent_fatal_flaws/ideas/cross_exam/
+    verdicts_on_others/responses)收敛成仅含 dict 的列表(修 ISSUE-002): 容忍模型把字段写成
+    字符串/标量,或在对象数组里混入裸字符串。非 list 一律视为空;list 内非 dict 元素剔除——
+    单席畸形字段不得让整个 stats/discuss 聚合崩栈,其余席已付费产物照常聚合。"""
+    if not isinstance(v, list):
+        return []
+    return [x for x in v if isinstance(x, dict)]
+
+
+def _num(v) -> float:
+    """把 confidence 之类数值字段收敛成 float(修 ISSUE-002): 模型偶尔把它写成字符串
+    ('high' / '0.8')或 null,直接进 sum() 会 TypeError。数字型(排除 bool)原样;
+    可转的数字字符串尽力转;其余记 0.0(与'缺失'同权,不夸大也不崩)。"""
+    if isinstance(v, bool):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _str(v) -> str:
+    """把该是字符串的字段收敛成 str(修 ISSUE-002): 模型偶尔把它写成 list/数字/null,
+    非字符串一律记空串,供 .strip()/拼接安全使用。"""
+    return v if isinstance(v, str) else ""
+
+
 def compute_stats(mode: str, results: list) -> dict:
     ok = [r for r in results if _parsed_ok(r)]
     failed = [r for r in results if not _parsed_ok(r)]
@@ -870,11 +902,11 @@ def compute_stats(mode: str, results: list) -> dict:
         verdicts, confs = {}, []
         for r in ok:
             p = r["parsed"]
-            v = p.get("verdict", "?")
+            v = p.get("verdict") if isinstance(p.get("verdict"), str) else "?"
             verdicts[v] = verdicts.get(v, 0) + 1
-            confs.append(p.get("confidence", 0) or 0)
-            for i in p.get("issues", []) or []:
-                s = i.get("severity", "low")
+            confs.append(_num(p.get("confidence")))
+            for i in _dict_items(p.get("issues")):
+                s = i.get("severity") if isinstance(i.get("severity"), str) else "low"
                 sev[s] = sev.get(s, 0) + 1
         base.update(verdict_tally=verdicts, issue_count_by_severity=sev,
                     mean_confidence=round(sum(confs) / len(confs), 2) if confs else None)
@@ -884,21 +916,22 @@ def compute_stats(mode: str, results: list) -> dict:
         spikes = 0
         for r in ok:
             p = r["parsed"]
-            c = p.get("claimed_option", "?")
+            c = p.get("claimed_option") if isinstance(p.get("claimed_option"), str) else "?"
             claims[c] = claims.get(c, 0) + 1
-            confs.append(p.get("confidence", 0) or 0)
-            for f in p.get("opponent_fatal_flaws", []) or []:
-                s = f.get("severity", "minor")
+            confs.append(_num(p.get("confidence")))
+            for f in _dict_items(p.get("opponent_fatal_flaws")):
+                s = f.get("severity") if isinstance(f.get("severity"), str) else "minor"
                 flaws[s] = flaws.get(s, 0) + 1
-            if (p.get("spike_suggestion") or "").strip():
+            sp = p.get("spike_suggestion")
+            if isinstance(sp, str) and sp.strip():
                 spikes += 1
         base.update(option_claims=claims, flaw_count_by_severity=flaws,
                     spike_suggestions=spikes,
                     mean_confidence=round(sum(confs) / len(confs), 2) if confs else None)
     else:  # brainstorm
-        total = sum(len(r["parsed"].get("ideas", []) or []) for r in ok)
-        solos = sum(1 for r in ok for i in (r["parsed"].get("ideas", []) or [])
-                    if (i.get("novelty", 0) or 0) >= 4)
+        total = sum(len(_dict_items(r["parsed"].get("ideas"))) for r in ok)
+        solos = sum(1 for r in ok for i in _dict_items(r["parsed"].get("ideas"))
+                    if _num(i.get("novelty")) >= 4)
         base.update(total_ideas_before_dedup=total, high_novelty_ideas=solos)
     return base
 
@@ -947,11 +980,12 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
         stance = {"validate": 0, "challenge": 0, "abstain": 0}
         challenged_titles = {}
         for r in ok:
-            for v in r["parsed"].get("verdicts_on_others", []) or []:
-                st = v.get("stance", "abstain")
+            for v in _dict_items(r["parsed"].get("verdicts_on_others")):
+                st = v.get("stance") if isinstance(v.get("stance"), str) else "abstain"
                 stance[st] = stance.get(st, 0) + 1
                 if st == "challenge":
-                    t = (v.get("ref_title") or "").strip()
+                    rt = v.get("ref_title")
+                    t = rt.strip() if isinstance(rt, str) else ""
                     if t:
                         challenged_titles[t] = challenged_titles.get(t, 0) + 1
         # 谄媚计数器: 相对上一轮,verdict 向上一轮多数派翻转、且本轮该员未提出任何 challenge(无新证据代理)
@@ -968,7 +1002,7 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
             if old_v != new_v:
                 movers += 1
                 made_challenge = any((v.get("stance") == "challenge")
-                                     for v in r["parsed"].get("verdicts_on_others", []) or [])
+                                     for v in _dict_items(r["parsed"].get("verdicts_on_others")))
                 # majority is not None 守卫(配合 F4 平票→None): 无多数派时不存在"翻向多数",
                 # 且防 new_v 亦为 None(verdict 缺失)时 None==None 误计一次 flip。
                 if majority is not None and new_v == majority and not made_challenge:
@@ -992,8 +1026,8 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
         shifts = 0
         prior_by = {r["name"]: r for r in prior_results if _parsed_ok(r)}
         for r in ok:
-            for e in r["parsed"].get("cross_exam", []) or []:
-                s = e.get("attack_severity", "minor")
+            for e in _dict_items(r["parsed"].get("cross_exam")):
+                s = e.get("attack_severity") if isinstance(e.get("attack_severity"), str) else "minor"
                 exam[s] = exam.get(s, 0) + 1
             pj = prior_by.get(r["name"])
             if pj and pj["parsed"].get("claimed_option") != r["parsed"].get("revised_claimed_option"):
@@ -1021,7 +1055,7 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
     pseudo_rounds = []
     for rnd in rounds:
         turns = [t["turn"] for t in ok if t.get("round") == rnd]
-        if turns and all(not (x.get("new_argument") or "").strip() for x in turns):
+        if turns and all(not _str(x.get("new_argument")).strip() for x in turns):
             pseudo_rounds.append(rnd)
     # 盲投漂移对照: 只给出(讨论终态 vs 盲投终态)配对,语义是否漂移交仲裁人判(不假装机械判等)
     last_by_seat = {}
@@ -1040,7 +1074,7 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
     dissent = []
     for seat, t in last_by_seat.items():
         p = t["turn"]
-        rebuts = [r for r in p.get("responses", []) if r.get("stance") == "rebut"]
+        rebuts = [r for r in _dict_items(p.get("responses")) if r.get("stance") == "rebut"]
         dissent.append({"seat": seat, "role": t.get("role"),
                         "still_holding": p.get("still_holding"),
                         "open_rebuttals": [r.get("reason") for r in rebuts]})

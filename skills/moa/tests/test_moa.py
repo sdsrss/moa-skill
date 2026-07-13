@@ -59,6 +59,51 @@ def test_stats_tolerates_non_object_member_output(tmp_path):
     assert stats["degraded"] is True
 
 
+def _mk(parsed):
+    return {"name": "x", "seat": "A", "role": "r", "model_used": "m",
+            "channel_used": "api", "parsed": parsed, "usage": None}
+
+
+@pytest.mark.parametrize("parsed", [
+    {"verdict": "pass", "confidence": "high", "issues": []},        # confidence 非数字字符串
+    {"verdict": "pass", "confidence": "0.8", "issues": []},         # 数字字符串
+    {"verdict": "pass", "confidence": 0.7, "issues": "无问题"},      # issues 写成字符串
+    {"verdict": "pass", "confidence": 0.7, "issues": ["缺测试"]},    # issues 为字符串数组
+    {"verdict": ["pass"], "confidence": 0.7, "issues": []},         # verdict 非字符串(不可哈希风险)
+    {"verdict": "pass", "confidence": 0.7,
+     "issues": [{"severity": ["high"]}]},                          # severity 非字符串
+])
+def test_compute_stats_review_malformed_fields_no_crash(parsed):
+    """ISSUE-002: 单席 review 嵌套字段类型错乱不得让 compute_stats 崩栈。"""
+    stats = moa.compute_stats("review", [_mk(parsed)])
+    assert stats["members_ok"] == 1        # parsed 是对象 → 仍算成功席,只是字段被容错
+    assert isinstance(stats["issue_count_by_severity"], dict)
+
+
+@pytest.mark.parametrize("mode,parsed", [
+    ("decide", {"claimed_option": "A", "confidence": "high",
+                "opponent_fatal_flaws": ["bad"], "spike_suggestion": ["x"]}),
+    ("brainstorm", {"ideas": ["idea one", "idea two"]}),
+    ("brainstorm", {"ideas": "just a string"}),
+])
+def test_compute_stats_decide_brainstorm_malformed_no_crash(mode, parsed):
+    """ISSUE-002: decide/brainstorm 嵌套字段类型错乱不得崩栈。"""
+    stats = moa.compute_stats(mode, [_mk(parsed)])
+    assert stats["members_ok"] == 1
+
+
+def test_compute_discuss_stats_malformed_responses_no_crash():
+    """ISSUE-002: 讨论回合 responses/new_argument 类型错乱不得让 discuss-stats 崩栈。"""
+    ts = [{"round": 1, "seat": "A", "role": "r",
+           "turn": {"still_holding": "x", "current_stance": "y",
+                    "responses": "agree with all",       # 应为对象数组,却是字符串
+                    "new_argument": ["not", "a", "string"],
+                    "position_changed": False}}]
+    stats = moa.compute_discuss_stats(ts, [])
+    assert stats["turns_ok"] == 1
+    assert isinstance(stats["dissent_preserved"], list)
+
+
 # ---------- 代理判定 no_proxy 边界 ----------
 
 def test_bypass_proxy_localhost():
