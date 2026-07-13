@@ -4,6 +4,7 @@
 覆盖: 配置/角色解析、代理判定、错误分类、JSON 修复、统计块、通道调度、
       fallback 展开、Quorum 宽限窗、endpoint 构造。真实 API/CLI 调用不在此(见 E2E)。
 """
+import io
 import json
 import os
 import sys
@@ -52,7 +53,9 @@ def test_bypass_proxy_no_proxy_suffix(monkeypatch):
 # ---------- 错误分类 (瞬态 vs 永久) ----------
 
 def _http_error(code):
-    return urllib.error.HTTPError("http://x", code, "msg", {}, None)
+    # fp 必须是真实可读对象: classify_http_error 的 4xx 分支会 e.read() 取 hint;
+    # Python 3.9 下 fp=None 会走 tempfile 路径 KeyError('file')(3.12 恰好宽容)——给 BytesIO 两版一致。
+    return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(b"msg"))
 
 
 def test_classify_429_transient():
