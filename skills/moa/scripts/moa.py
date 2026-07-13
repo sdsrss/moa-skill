@@ -1240,6 +1240,29 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
 
 # ---------- 主流程 ----------
 
+def _read_input(path: str) -> str:
+    """读 --input 简报文本;不存在/不可读时给具名 `[input]` 报错而非裸 FileNotFoundError
+    traceback(修 ISSUE-005)——对齐 resolve_config 的 config-缺失体验。最常用的参数不该最糙。"""
+    p = Path(path)
+    if not p.exists():
+        sys.exit(f"[input] 简报文件不存在: {path}(检查 --input 路径,或先按 briefing.md 写 brief.md)")
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"[input] 读取简报失败: {path} ({e})")
+
+
+def _read_inject(path: str):
+    """读 --inject 的 CH1 子代理 JSON 并解析;不存在给具名报错(修 ISSUE-005)。"""
+    p = Path(path)
+    if not p.exists():
+        sys.exit(f"[inject] 注入文件不存在: {path}(检查 --inject 路径)")
+    try:
+        return parse_json(p.read_text(encoding="utf-8"))
+    except OSError as e:
+        sys.exit(f"[inject] 读取注入文件失败: {path} ({e})")
+
+
 def resolve_config(path_arg, allow_example_fallback=True):
     """--config 显式给出则用它;否则找 cwd/config.yaml。二者皆无时:
     generate/dry-run 允许回退到 assets/config.example.yaml(首跑体验);
@@ -1372,7 +1395,7 @@ def apply_custom_committee(cfg: dict, args) -> dict:
 
 
 def cmd_generate(args, cfg):
-    material = Path(args.input).read_text(encoding="utf-8")
+    material = _read_input(args.input)
     warn_sensitive_material(material)  # 外发前敏感信息扫描(不阻断;dry-run 已先给用户看)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
@@ -1465,7 +1488,7 @@ def cmd_refine(args, cfg):
     输入上一轮 = round-1(生成为 0)。仅 review/decide 有精炼轮;brainstorm 无。"""
     if args.mode == "brainstorm":
         sys.exit("[refine] brainstorm 模式无精炼轮(策展直接在收敛阶段)。")
-    material = Path(args.input).read_text(encoding="utf-8")
+    material = _read_input(args.input)
     warn_sensitive_material(material)  # --input 可换文件,精炼轮同样外发,补敏感扫描(C5)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
@@ -1535,7 +1558,7 @@ def _one_member(cfg, member_filter, what):
 def cmd_discuss_turn(args, cfg):
     """开会讨论单回合(§6 阶段5): 一位委员看见此前发言、发言、追加到 discussion.jsonl。
     CH2/CH3 席由本命令直接派发;CH1 席由仲裁人用 discuss-prompt 取词外派发,再 --inject 回填。"""
-    material = Path(args.input).read_text(encoding="utf-8")
+    material = _read_input(args.input)
     if not args.inject:                # 注入回填不外发;真实派发回合补敏感扫描(C5)
         warn_sensitive_material(material)
     opts = cfg["options"]
@@ -1545,7 +1568,7 @@ def cmd_discuss_turn(args, cfg):
     collect.mkdir(parents=True, exist_ok=True)
     round_no = args.round
     if args.inject:
-        parsed = parse_json(Path(args.inject).read_text(encoding="utf-8"))
+        parsed = _read_inject(args.inject)
         if parsed is None:
             sys.exit(f"--inject 内容非合法 JSON: {args.inject}")
         res = _inject_result(m, args.mode, parsed)
@@ -1560,7 +1583,7 @@ def cmd_discuss_turn(args, cfg):
 
 def cmd_discuss_prompt(args, cfg):
     """打印某席本回合(或盲投,--blind)的 system/user 精确 prompt,供仲裁人给 CH1 子代理用同一提示词。"""
-    material = Path(args.input).read_text(encoding="utf-8")
+    material = _read_input(args.input)
     custom_roles = cfg.get("custom_roles", {}) or {}
     m = _one_member(cfg, args.member, "discuss-prompt")
     transcript_str = format_transcript(load_transcript(Path(args.collect_dir)))
@@ -1570,14 +1593,14 @@ def cmd_discuss_prompt(args, cfg):
 
 def cmd_discuss_blindvote(args, cfg):
     """收尾盲投(漂移检测): 委员不看讨论记录,仅凭简报独立复述最终立场。写 blindvote_<seat>.json。"""
-    material = Path(args.input).read_text(encoding="utf-8")
+    material = _read_input(args.input)
     opts = cfg["options"]
     custom_roles = cfg.get("custom_roles", {}) or {}
     m = _one_member(cfg, args.member, "discuss-blindvote")
     collect = Path(args.collect_dir)
     collect.mkdir(parents=True, exist_ok=True)
     if args.inject:
-        parsed = parse_json(Path(args.inject).read_text(encoding="utf-8"))
+        parsed = _read_inject(args.inject)
         if parsed is None:
             sys.exit(f"--inject 内容非合法 JSON: {args.inject}")
         res = _inject_result(m, args.mode, parsed)
@@ -1608,7 +1631,7 @@ def cmd_discuss_stats(args, cfg):
 
 
 def cmd_dry_run(args, cfg):
-    material = Path(args.input).read_text(encoding="utf-8") if args.input else ""
+    material = _read_input(args.input) if args.input else ""
     dry_run(cfg, args.mode, material, args.topic, args.refine_rounds)
 
 

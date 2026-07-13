@@ -303,6 +303,25 @@ def test_validate_config_rejects_broken(cfg):
         moa.validate_config(cfg)
 
 
+def test_read_input_missing_file_named_error(tmp_path):
+    """ISSUE-005: --input 指向不存在文件 → 具名 SystemExit,而非裸 FileNotFoundError traceback。"""
+    with pytest.raises(SystemExit) as ei:
+        moa._read_input(str(tmp_path / "nope.md"))
+    assert "[input]" in str(ei.value)
+
+
+def test_read_input_reads_existing(tmp_path):
+    f = tmp_path / "brief.md"
+    f.write_text("hello 简报", encoding="utf-8")
+    assert moa._read_input(str(f)) == "hello 简报"
+
+
+def test_read_inject_missing_file_named_error(tmp_path):
+    with pytest.raises(SystemExit) as ei:
+        moa._read_inject(str(tmp_path / "nope.json"))
+    assert "[inject]" in str(ei.value)
+
+
 def test_validate_config_accepts_valid_numeric_options():
     """数值选项合法值: 未设 / 正数 / min_successful_members=0 均放行(ISSUE-003)。"""
     moa.validate_config({"members": [{"name": "a", "timeout_seconds": 240},   # 按席正数
