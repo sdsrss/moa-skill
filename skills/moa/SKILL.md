@@ -7,7 +7,9 @@ description: MoA multi-model committee — you (the arbiter) chair up to 4 heter
 
 把多个异构大模型组成"委员会":委员互相隔离、各领角色独立盲审,当前 agent 作为仲裁人按硬规则收敛。原理基于 Mixture-of-Agents——不同模型盲点不同,独立盲审 + 结构化聚合能突破单模型上限。角色契约、收敛硬规则与简报模板见本目录 `references/`。
 
-> **实现状态:v1.5.0**。已可用:三通道(CH2 CLI:auggie/codex,检测到 auggie 优先 + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex+auggie(v1.4.0 auggie 双席实跑 2/2,含 auto 检测)/ CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
+> **实现状态:v1.6.0**。已可用:三通道(CH2 CLI:auggie/codex,检测到 auggie 优先 + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗(可按席覆盖 `grace_seconds`)、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex+auggie(v1.4.0 auggie 双席实跑 2/2,含 auto 检测)/ CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
+>
+> **v1.6.0 变更**:Quorum 宽限窗支持**按席覆盖**——member 上可设 `grace_seconds`,给"高价值但慢"的重推理旗舰席(Fable 5 / Gemini Pro 类)单独放宽,避免它在精炼互评轮被全局小窗系统性牺牲(只丢那一票、不丢结论,但缺最强席的共识计量);未设则继承全局、行为不变。config 示例全局默认 `grace_seconds` 30→90;脚本 fallback 保持 30(向后兼容)。tests 169→170。
 >
 > **v1.5.0 变更**:默认阵容改为**真·四家族**(D 席从第二个 Anthropic Self-MoA 子代理换为 Moonshot/kimi-k2.7 走 auggie,修审核 §7 的 B/D+仲裁人 3/5 同家族相关性;D 席 kimi 已实测 generate 落盘 64.7s OK)——**默认计费席 2→3**,回退法见 `config.example.yaml` 注释;新增 GitHub Actions CI(测试 + leak-check + 版本/徽章一致性,`.github/workflows/ci.yml`);修 v1.4.0 审核 P3(refine 全败止损 / early_stop 失败席抑制 / 多数派平票 / auto cli_kind 顶替 model 告警 / dry-run fallback 计费提示);补披露跨席注入传播、仲裁人同家族、置信度序数化。tests 162→169。
 
@@ -65,7 +67,7 @@ python skills/moa/scripts/moa.py stats --mode review --collect-dir moa-reports/r
 3. 把子代理返回的 JSON 按 `member_<name>.json` 格式写入**同一** `--collect-dir`;
 4. 两边都落盘后,再跑 `moa.py stats`——统计块即覆盖全部席位(含 CH1)。
 
-产物:`moa-reports/run/member_<name>.json`(逐委员结构化意见)、`stats.json`(机械统计,含 `degraded` 标记与每席实际 model/channel)。脚本**可派发席**(CH2/CH3)的成功数 < `min(options.min_successful_members, 可派发席数)`(默认 2)时中止——纯 subagent(CH1)席由你另行派发、不计入此门,合流后含 CH1 的整体法定数由你判定;全 CH1 配置时脚本无席可跑,干净退出不报错。达法定数后落伍席位有 `grace_seconds`(默认 30s)宽限窗,超时标 `skipped_grace`(不算失败)。
+产物:`moa-reports/run/member_<name>.json`(逐委员结构化意见)、`stats.json`(机械统计,含 `degraded` 标记与每席实际 model/channel)。脚本**可派发席**(CH2/CH3)的成功数 < `min(options.min_successful_members, 可派发席数)`(默认 2)时中止——纯 subagent(CH1)席由你另行派发、不计入此门,合流后含 CH1 的整体法定数由你判定;全 CH1 配置时脚本无席可跑,干净退出不报错。达法定数后落伍席位有 `grace_seconds`(config 示例默认 90s,脚本 fallback 30s;可在 member 上按席覆盖——给重推理旗舰慢席单独放宽,不被全局窗牺牲)宽限窗,超时标 `skipped_grace`(不算失败)。
 
 **mode 与场景**:`--mode review`(评审/审查/二次确认/总结评审)、`--mode decide`(多选项决策,委员按 `roles-decide.md` 认领选项对抗论证)、`--mode brainstorm`(头脑风暴,发散人格,无精炼轮)。决策的认领角色由你在 config `custom_roles` 里按选项注入(见 `references/roles-decide.md`)。
 

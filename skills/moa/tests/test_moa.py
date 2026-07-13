@@ -650,6 +650,35 @@ def test_dispatch_grace_returns_without_joining_straggler():
     assert by["slow"]["err_class"] == "skipped_grace" and by["slow"]["parsed"] is None
 
 
+def test_dispatch_member_grace_override_survives_while_default_skips():
+    """按席 grace override(v1.6.0): 同一轮两个落伍席——slowKept 带 member 级
+    grace_seconds 大窗应【存活】(在全局小窗下本会被牺牲); slowDrop 不带 override,
+    按全局小窗被 skipped_grace。证按席宽限生效 + 未设 override 的默认行为不变。"""
+    members = [{"name": "fast1", "seat": "A"}, {"name": "fast2", "seat": "B"},
+               {"name": "slowKept", "seat": "C", "grace_seconds": 2.0},
+               {"name": "slowDrop", "seat": "D"}]  # 无 override → 用全局 grace_s
+
+    def fn(m):
+        if m["name"] == "slowKept":
+            time.sleep(0.4)     # < 自身 2.0s 窗 → 应完成
+        elif m["name"] == "slowDrop":
+            time.sleep(3.0)     # >> 全局 0.1s 窗 → 应被 skip
+        return {"name": m["name"], "seat": m["seat"], "parsed": {"ok": 1},
+                "role": "r", "channel_used": "api", "latency_s": 0.0,
+                "model_used": "m", "err_class": None, "error": None}
+
+    t0 = time.monotonic()
+    res = moa.dispatch_with_quorum(members, fn, quorum_target=2, grace_s=0.1)
+    elapsed = time.monotonic() - t0
+    by = {r["name"]: r for r in res}
+    # 高价值慢席用自身大窗存活
+    assert by["slowKept"]["parsed"] and by["slowKept"]["err_class"] is None
+    # 未设 override 的落伍席仍按全局小窗被牺牲(默认不变)
+    assert by["slowDrop"]["err_class"] == "skipped_grace" and by["slowDrop"]["parsed"] is None
+    # slowDrop 的 3.0s 阻塞不得拖累返回(其窗 0.1s 到期即弃, slowKept 0.4s 完成)
+    assert elapsed < 1.5, f"按席窗未独立生效 (wall={elapsed:.1f}s)"
+
+
 # ---------- main() argparse 接线冒烟(此前 0 覆盖) ----------
 
 def test_main_stats_routes_without_config(tmp_path, monkeypatch, capsys):

@@ -3,6 +3,33 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.6.0] — 2026-07-13
+
+> **Migration note (user-visible default change)**: the Quorum grace window is now
+> **per-seat configurable**, and the shipped `config.example.yaml` raises the global
+> `grace_seconds` default **30 → 90**. Why: reasoning-heavy flagship seats (Fable 5 /
+> Gemini Pro) are inherently slow, so a 30s window systematically sacrifices the
+> *strongest* seat's refine-round peer-vote once quorum is reached (its first-round opinion
+> still lands — only its vote on others is lost, but the consensus tally then misses the
+> best seat). A 90s window usually waits it back. **Revert / opt-out**: set
+> `options.grace_seconds: 30` (or any value) in your config; the **script fallback stays
+> 30**, so existing configs that don't set the key are unchanged. **Discoverability**:
+> config comment on both `options.grace_seconds` and seat C's `grace_seconds` example, plus
+> the SKILL.md status banner.
+
+### Added
+- **Per-seat `grace_seconds` override** in `dispatch_with_quorum`: each straggler's window =
+  `member.get("grace_seconds", global_grace_s)`, so a high-value slow seat can be granted a
+  wider window while the rest keep the global default. Windows are registered per-seat at the
+  moment quorum is reached and expire independently — no single global cut-off. Backward
+  compatible: seats without the field behave exactly as before. New test
+  `test_dispatch_member_grace_override_survives_while_default_skips` (mixed run: one overridden
+  straggler survives, one default straggler is skipped in the same call). Suite 169 → 170.
+
+### Changed
+- `config.example.yaml` global `options.grace_seconds` default **30 → 90** (see migration note);
+  added a commented `grace_seconds: 150` example on seat C (Gemini) demonstrating per-seat override.
+
 ## [1.5.0] — 2026-07-13
 
 > **Migration note (user-visible default change)**: the default committee now fields a **genuine

@@ -725,14 +725,19 @@ DEFAULT_SEAT_ROLE = {
 
 def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     """Quorum 宽限窗(design.md §10): 存活委员数达 quorum_target 后,给仍在跑的落伍者
-    grace_s 秒宽限;超时者标 skipped_grace(不算失败)。每完成一个即回调 on_done(res) 落盘,
+    宽限;超时者标 skipped_grace(不算失败)。每完成一个即回调 on_done(res) 落盘,
     保证即便落伍者拖尾,collect-dir 也已有法定结果。返回按 members 原序的结果列表。
+
+    按席宽限(v1.6.0): 每个落伍席的窗长 = member.get("grace_seconds", grace_s)——即
+    可给"高价值但慢"的旗舰席(如重推理模型)单独放宽,不被全局小窗牺牲,而其余席仍用
+    全局默认。故不再是【单一全局 deadline 一刀切】,而是达法定数时给当时每个 pending 席各记
+    自己的到期时刻,逐席独立到期、独立 skip。未设 member 级值的席行为与旧版一致(向后兼容)。
 
     止损语义(修 P0-1): 宽限到期必须让【本函数立即返回】,不得 join 落伍线程。此前用
     `with ThreadPoolExecutor` 管理,块退出隐式 shutdown(wait=True) 会 join 全部线程,
     使本函数阻塞至最慢席结束(实测 3 席 grace=0.5s 函数仍 6s 才返回)。现改手动管理:
-    到期 shutdown(wait=False),函数即刻返回,仲裁流程拿到法定结果继续、collect-dir 已有
-    法定产物。范围限定: 界定的是【函数返回延迟】,不是进程总 wall-clock——落伍工作线程
+    任一席被弃即 shutdown(wait=False),函数即刻返回,仲裁流程拿到法定结果继续、collect-dir
+    已有法定产物。范围限定: 界定的是【函数返回延迟】,不是进程总 wall-clock——落伍工作线程
     仍在后台跑,concurrent.futures 的 atexit 会在解释器退出时 join 它们,故 `generate`
     进程收尾可能再等落伍席一小段(上界 = member 级 timeout,不无限拖尾)。要连进程退出也
     界定需改 daemon 线程,但那会硬杀在途 HTTP,得不偿失,故不做。"""
@@ -743,23 +748,14 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
         futs = {ex.submit(fn, m): m for m in members}
         pending = set(futs)
         ok = 0
-        grace_deadline = None
+        deadlines = {}   # fut -> 各席 monotonic 到期时刻; 达法定数后一次性登记, 之后逐席到期
         while pending:
             timeout = None
-            if grace_deadline is not None:
-                timeout = max(0.0, grace_deadline - time.monotonic())
+            live = [deadlines[f] for f in pending if f in deadlines]
+            if live:
+                timeout = max(0.0, min(live) - time.monotonic())
             done, pending = concurrent.futures.wait(
                 pending, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
-            if not done and grace_deadline is not None:  # 宽限到期: 放弃落伍者, 立即返回
-                for fut in list(pending):
-                    m = futs[fut]
-                    r = _skipped_grace(m)
-                    results[m["name"]] = r
-                    if on_done:
-                        on_done(r)
-                    fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
-                abandoned = True
-                break
             for fut in done:
                 m = futs[fut]
                 r = fut.result()
@@ -768,8 +764,24 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                     on_done(r)
                 if r.get("parsed"):
                     ok += 1
-            if grace_deadline is None and ok >= quorum_target and pending:
-                grace_deadline = time.monotonic() + grace_s
+            # 达法定数: 给当时每个 pending 席登记各自窗(member 级覆盖全局), 只登记一次。
+            if not deadlines and ok >= quorum_target and pending:
+                now = time.monotonic()
+                for fut in pending:
+                    g = futs[fut].get("grace_seconds")
+                    deadlines[fut] = now + (grace_s if g is None else g)
+            # 逐席检查: 已过自身窗的落伍席即弃(不等其余席), 立即返回(不 join)。
+            if deadlines:
+                now = time.monotonic()
+                for fut in [f for f in pending if f in deadlines and now >= deadlines[f]]:
+                    m = futs[fut]
+                    r = _skipped_grace(m)
+                    results[m["name"]] = r
+                    if on_done:
+                        on_done(r)
+                    fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
+                    pending.discard(fut)
+                    abandoned = True
     finally:
         # abandoned=True → wait=False 立即交还控制权(不 join 落伍线程); 正常完成 → wait=True。
         ex.shutdown(wait=not abandoned)

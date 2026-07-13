@@ -67,6 +67,9 @@ members:
     cli_kind: auggie           # 2026-07-13 实测: 96.7s/5.4KB 完整;同席走 OpenRouter 曾 1KB 空壳
     model: gemini-3.1-pro-preview      # (推理吃光 max_tokens;api 通道 v1.4.0 已修但 auggie 更省心)
     timeout_seconds: 240       # Gemini 系较慢,单独放宽(auggie 并发实测 97s,勿低于 120)
+    # grace_seconds: 150       # (v1.6.0)按席宽限窗覆盖 options.grace_seconds。给这类"高价值但慢"
+                               #   的席单独放宽, 让它一定赶上精炼互评轮, 而其余席仍用全局 90s。
+                               #   不设则继承全局值; timeout_seconds 管"单席不被杀", 此项管"宽限窗等不等它", 两者独立。
     fallback:
       - {channel: api, protocol: openrouter, model: google/gemini-3.1-pro-preview}
 
@@ -91,7 +94,11 @@ options:
   max_tokens_member: 3000      # review/brainstorm 够用;decide + 推理模型长输出建议调到 >=8000
   timeout_seconds: 180         # 全局默认;member 级 timeout_seconds 覆盖之
   min_successful_members: 2    # 运行时取 min(此值, 席位数),避免 L1 单委员被误杀
-  grace_seconds: 30            # 达法定席位数后,给落伍者的宽限窗
+  grace_seconds: 90            # 达法定席位数后,给落伍者的全局宽限窗(v1.6.0: 30→90)。
+                               # 重推理旗舰席(Fable 5 / Gemini Pro 类)天生慢, 30s 窗易把
+                               # 最强的那一席在精炼互评轮系统性牺牲掉——90s 让它大概率被等回来。
+                               # 代价: 落伍席拖尾时函数返回延迟上界从 30s 抬到 90s。要更细可按席覆盖
+                               # (见 C 席的 grace_seconds 示例); 脚本 fallback 默认仍 30(未配时向后兼容)。
   # max_refine_rounds: 2       # 仅供仲裁人参考的约定值,脚本不消费(轮数由 CLI --round / --refine-rounds 决定)
   # 温度: 未设 member.temperature_generate 时,脚本按模式取默认——brainstorm=0.9(求发散),
   # review/decide=0.3(求稳定判断)。要覆盖就在 member 上显式设 temperature_generate。
