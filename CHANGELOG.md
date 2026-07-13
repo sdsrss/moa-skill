@@ -3,6 +3,54 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.6.2] — 2026-07-13
+
+Robustness hardening from an autonomous QA self-test loop (5 rounds, black-box + white-box).
+All changes are bugfixes / fail-fast on already-broken input; **no behavior change for valid
+configs or well-formed member output** (well-formed stats output verified byte-identical).
+
+### Fixed
+- **Aggregation no longer crashes on ill-shaped member output.** `parse_json` returned any
+  parseable JSON (a top-level array/scalar/bool), which is truthy and was treated as a successful
+  member — then `compute_stats` / `compute_refine_stats` / `compute_discuss_stats` /
+  `_majority_verdict` called `.get()` on it and raised `AttributeError`, killing the whole `stats`
+  run and every other paid seat's tally. `parse_json` now returns a dict-or-`None` (recovering an
+  embedded `{...}` from a single-object array like `[{...}]`), and the aggregation layer independently
+  gates success on `isinstance(parsed, dict)` so the CH1 arbiter-hand-written `member_*.json` path
+  (which bypasses `parse_json`) can't crash `stats` either. (ISSUE-001)
+- **Nested member fields are now type-guarded.** Object-array fields (`issues`, `opponent_fatal_flaws`,
+  `ideas`, `cross_exam`, `verdicts_on_others`, `responses`) were iterated as list-of-dict and
+  `.get()`'d, and `confidence` was summed as a number — so a single seat returning `issues: "none"`,
+  `confidence: "high"`, `verdict: ["pass"]`, or `ideas: ["a","b"]` crashed the whole aggregation.
+  Added `_dict_items` / `_num` / `_str` guards and coerced tally keys (verdict / severity /
+  claimed_option) to strings (avoids unhashable-key crashes). Malformed fields are tolerated
+  field-by-field, not fatal. (ISSUE-002)
+- **The remaining numeric config options are validated** like `grace_seconds` was in v1.6.1:
+  `min_successful_members` (non-negative; `0` = no floor), `timeout_seconds` (global + per-seat),
+  and `max_tokens_member` must be numbers. A quoted `min_successful_members: "2"` previously raised
+  an uncaught `TypeError` aborting the whole run; quoted `timeout_seconds` / `max_tokens_member`
+  produced cryptic `float + str` seat failures. All now exit with a named `[config] …` error. (ISSUE-003)
+- **`discuss` now requires unique seats.** In `discuss`, `seat` is the anonymized speaker identity —
+  it drives how members reference each other (`responses.to` "委员X"), the transcript speaker labels,
+  and every stats/blindvote aggregation key (`last_by_seat`, `bv_by_seat`, `blindvote_<seat>.json`).
+  Two members sharing a seat silently broke all three (ambiguous cross-references, indistinguishable
+  labels, one seat dropped from drift/dissent via overwrite). `discuss-turn` / `discuss-prompt` /
+  `discuss-blindvote` now fail fast with a named error naming the colliding members; `discuss-blindvote`
+  additionally refuses to overwrite a seat's vote already written by a different-named member
+  (same name = idempotent re-run). Duplicate seats remain **legal in `generate` / `refine`** (keyed by
+  unique `name`, e.g. two feasibility skeptics) — the guard is scoped to `discuss` only. (ISSUE-004)
+- **Missing `--input` / `--inject` files give a named error** instead of a raw `FileNotFoundError`
+  traceback. `generate` / `refine` / `dry-run` / `discuss-*` read the file with no existence check,
+  so a typo'd brief path — the most common argument — dumped a traceback while every other missing
+  resource (config, products) got a clean message. Added `_read_input` / `_read_inject` with
+  `[input]` / `[inject]`-prefixed errors. (ISSUE-005)
+
+### Testing
+- Suite 177 → **209** (+32 assertions): non-object `parse_json` recovery, non-object/malformed-field
+  tolerance across all three stats modes + discuss, the four new numeric-config rejections (global +
+  per-seat), missing-input/inject named errors, and the `discuss` seat-uniqueness gate + blindvote
+  overwrite guard. `leak-check` clean.
+
 ## [1.6.1] — 2026-07-13
 
 Hardening follow-up to v1.6.0's new per-seat `grace_seconds` field (from a fresh code review).
