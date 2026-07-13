@@ -1211,6 +1211,11 @@ def resolve_config(path_arg, allow_example_fallback=True):
 def validate_config(cfg):
     """最小 schema 校验(修 P1-1 / C3): 缺关键字段给指名报错,而非裸 KeyError/traceback。
     只查会导致运行时崩溃的硬约束,不做全字段校验(配置层刻意宽松,允许自定义键)。"""
+    def _bad_grace(v):
+        # grace_seconds(全局/按席)进 dispatch_with_quorum 做 `now + v` 算术: 非数值(如 YAML 引号
+        # 化的 "150")会裸 TypeError 中止整轮; 负值(如手误 -5)使窗立即过期→本想"保住慢席"却静默
+        # 反把它秒弃。未设(None)= 用默认, 合法。bool 是 int 子类但语义非秒数, 一并拒。
+        return v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0)
     if not isinstance(cfg, dict):
         sys.exit("[config] 顶层必须是 YAML 映射(dict);参照 assets/config.example.yaml")
     members = cfg.get("members")
@@ -1234,6 +1239,9 @@ def validate_config(cfg):
                   f"检测到 auggie 时优先走 auggie 且只认 auggie_model;你设了 model={m['model']!r} 但无 "
                   f"auggie_model,auggie 路径会用其默认模型顶替。要精确控制请显式 cli_kind 或补 auggie_model。",
                   file=sys.stderr)
+        if _bad_grace(m.get("grace_seconds")):
+            sys.exit(f"[config] members[{i}] ({m.get('name')}) grace_seconds="
+                     f"{m.get('grace_seconds')!r} 非法(应为非负数值秒数,如 150 或 90.0)")
         names.append(m["name"])
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
@@ -1247,9 +1255,13 @@ def validate_config(cfg):
             sys.exit(f"[config] member name {n!r} 与 {safe_seen[s]!r} 经文件名规范化后同为 "
                      f"member_{s}.json,会互相覆盖;请改用规范化后仍相异的名字")
         safe_seen[s] = n
-    if not isinstance(cfg.get("options"), dict):
+    opts = cfg.get("options")
+    if not isinstance(opts, dict):
         sys.exit("[config] 缺 options 块(max_tokens_member/timeout_seconds/min_successful_members 等);"
                  "参照 assets/config.example.yaml")
+    if _bad_grace(opts.get("grace_seconds")):
+        sys.exit(f"[config] options.grace_seconds={opts.get('grace_seconds')!r} "
+                 f"非法(应为非负数值秒数,如 90)")
 
 
 # ---------- custom 模式: --members/--models 命令行入口 ----------

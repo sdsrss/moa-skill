@@ -211,6 +211,12 @@ def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     {"members": [{"name": "x", "channel": "bogus"}], "options": {}},  # channel 非法
     {"members": [{"name": "x"}, {"name": "x"}], "options": {}},       # name 重复(会互相覆盖)
     {"members": [{"name": "a/b"}, {"name": "a_b"}], "options": {}},   # 规范化后碰撞(→同一文件名)
+    # grace_seconds 校验(v1.6.1): 非数值 → dispatch `now+v` 裸 TypeError; 负值 → 窗立即过期静默秒弃席
+    {"members": [{"name": "x", "grace_seconds": "150"}], "options": {}},  # 按席 非数值(YAML 引号化)
+    {"members": [{"name": "x", "grace_seconds": -5}], "options": {}},     # 按席 负值(手误 → 反效果)
+    {"members": [{"name": "x", "grace_seconds": True}], "options": {}},   # 按席 bool(非秒数语义)
+    {"members": [{"name": "x"}], "options": {"grace_seconds": "90"}},     # 全局 非数值
+    {"members": [{"name": "x"}], "options": {"grace_seconds": -1}},       # 全局 负值
 ])
 def test_validate_config_rejects_broken(cfg):
     with pytest.raises(SystemExit):
@@ -222,6 +228,15 @@ def test_validate_config_accepts_valid():
                                      {"name": "b", "channel": "subagent"},
                                      {"name": "c"}],  # channel 省略默认 api
                          "options": {"max_tokens_member": 100}})
+
+
+def test_validate_config_accepts_valid_grace():
+    """grace_seconds 合法值: 未设 / int / float / 0 均放行(全局与按席)。"""
+    moa.validate_config({"members": [{"name": "a", "grace_seconds": 150},      # int
+                                     {"name": "b", "grace_seconds": 90.0},     # float
+                                     {"name": "c", "grace_seconds": 0},        # 0 = 无宽限, 合法
+                                     {"name": "d"}],                           # 未设 = 用默认
+                         "options": {"grace_seconds": 90}})
 
 
 # ---------- F5: auto cli_kind + model 无 auggie_model → 告警(不阻断) ----------
@@ -677,6 +692,27 @@ def test_dispatch_member_grace_override_survives_while_default_skips():
     assert by["slowDrop"]["err_class"] == "skipped_grace" and by["slowDrop"]["parsed"] is None
     # slowDrop 的 3.0s 阻塞不得拖累返回(其窗 0.1s 到期即弃, slowKept 0.4s 完成)
     assert elapsed < 1.5, f"按席窗未独立生效 (wall={elapsed:.1f}s)"
+
+
+def test_dispatch_member_grace_zero_skips_immediately_under_large_global():
+    """按席 grace_seconds=0: 达法定数即刻弃该落伍席, 不受全局大窗影响(反向覆盖: 按席窗
+    确实压过全局)。全局 grace_s=10 本会等很久, 但该席自设 0 → 秒弃 → 函数迅速返回。"""
+    members = [{"name": "fast1", "seat": "A"}, {"name": "fast2", "seat": "B"},
+               {"name": "noWait", "seat": "C", "grace_seconds": 0}]
+
+    def fn(m):
+        if m["name"] == "noWait":
+            time.sleep(3.0)     # 慢, 但自身 0 窗 → 达标即弃, 不等它
+        return {"name": m["name"], "seat": m["seat"], "parsed": {"ok": 1},
+                "role": "r", "channel_used": "api", "latency_s": 0.0,
+                "model_used": "m", "err_class": None, "error": None}
+
+    t0 = time.monotonic()
+    res = moa.dispatch_with_quorum(members, fn, quorum_target=2, grace_s=10.0)
+    elapsed = time.monotonic() - t0
+    by = {r["name"]: r for r in res}
+    assert by["noWait"]["err_class"] == "skipped_grace" and by["noWait"]["parsed"] is None
+    assert elapsed < 1.0, f"按席 0 窗未压过全局大窗 (wall={elapsed:.1f}s)"
 
 
 # ---------- main() argparse 接线冒烟(此前 0 覆盖) ----------

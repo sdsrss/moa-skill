@@ -3,6 +3,27 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.6.1] — 2026-07-13
+
+Hardening follow-up to v1.6.0's new per-seat `grace_seconds` field (from a fresh code review).
+No behavior change for valid configs; strictly fails faster on already-broken input.
+
+### Fixed
+- **`grace_seconds` now validated in `validate_config`** (global `options.grace_seconds` and
+  per-seat `member.grace_seconds`): must be a non-negative number. Previously a quoted/non-numeric
+  YAML value (`grace_seconds: "90"`) raised an opaque `TypeError` deep inside the thread dispatch
+  and aborted the whole run, and a negative value (`grace_seconds: -5`, a plausible typo) made the
+  window expire immediately — silently dropping the very seat it was meant to keep. Both now exit
+  at config-validation time with a named `[config] …` error, consistent with the existing
+  channel / cli_kind / duplicate-name fail-fasts. `bool` is rejected too (int subclass, not a
+  seconds value). Absent field is unchanged (uses the default).
+
+### Testing
+- Added 5 negative cases (global & per-seat × non-numeric / negative / bool) to
+  `test_validate_config_rejects_broken`, a positive `test_validate_config_accepts_valid_grace`
+  (int / float / 0 / absent), and `test_dispatch_member_grace_zero_skips_immediately_under_large_global`
+  (per-seat window overrides a large global window). Suite 170 → 177.
+
 ## [1.6.0] — 2026-07-13
 
 > **Migration note (user-visible default change)**: the Quorum grace window is now
