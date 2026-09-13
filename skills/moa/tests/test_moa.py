@@ -15,6 +15,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import moa  # noqa: E402
@@ -346,24 +347,64 @@ def test_validate_config_accepts_valid_grace():
                          "options": {"grace_seconds": 90}})
 
 
-# ---------- F5: auto cli_kind + model 无 auggie_model → 告警(不阻断) ----------
+# ---------- ISSUE-008(原 F5 告警升级为硬门): auto cli_kind + model 无 auggie_model → 拒绝启动 ----------
 
-def test_validate_config_warns_auto_cli_model_without_auggie_model(capsys):
-    """F5: channel=cli + auto(默认)+ 设了 model 但无 auggie_model → 打告警
-    (auggie 优先且只认 auggie_model,member.model 会被静默顶替)。不阻断(不抛 SystemExit)。"""
-    moa.validate_config({"members": [{"name": "a", "channel": "cli", "model": "gpt5.6-sol"}],
-                         "options": {}})
-    err = capsys.readouterr().err
-    assert "auggie_model" in err and "顶替" in err
+def test_validate_config_rejects_auto_cli_model_without_auggie_model():
+    """channel=cli + auto(默认)+ 设了 model 但无 auggie_model → 拒绝启动。
+    升级为硬门的理由不是「配置没生效」,而是该席会跑一个不可知的模型(auggie 只认 auggie_model,
+    member.model 被静默顶替、model_used 记 None),让 synthesis.md 的家族构成披露硬规则不可执行。
+    报错须同时给出两条修法,否则用户不知道该补 auggie_model 还是写 cli_kind。"""
+    with pytest.raises(SystemExit) as e:
+        moa.validate_config({"members": [{"name": "a", "channel": "cli", "model": "gpt5.6-sol"}],
+                             "options": {}})
+    msg = str(e.value)
+    assert "auggie_model" in msg and "cli_kind" in msg
 
 
-def test_validate_config_no_warn_when_auggie_model_present(capsys):
-    """显式 auggie_model(或显式 cli_kind)→ 无 F5 告警。"""
+def test_validate_config_accepts_explicit_auggie_model_or_cli_kind():
+    """显式 auggie_model 或显式 cli_kind → 模型可知,放行(出厂 config 全部走这条路径)。"""
     moa.validate_config({"members": [
         {"name": "a", "channel": "cli", "model": "x", "auggie_model": "gpt5.6-sol"},
-        {"name": "b", "channel": "cli", "cli_kind": "codex", "model": "y"},  # 显式 kind → 无告警
+        {"name": "b", "channel": "cli", "cli_kind": "codex", "model": "y"},   # 显式 kind 直接用 model
+        {"name": "c", "channel": "cli", "cli_kind": "codex", "model": None},  # codex 默认模型: 合法
     ], "options": {}})
-    assert "顶替" not in capsys.readouterr().err
+
+
+def test_validate_config_rejects_ambiguous_cli_in_fallback_links():
+    """预审评审 #4: ISSUE-008 的硬门此前只看顶层 member,而 resolve_channel 会把每个 fallback
+    项 merge 成 {**member, **fb} 再走同一套 auto→auggie 优先。于是 fallback 里的 cli 链同样会
+    静默跑 auggie 的默认模型、model_used 记 None ——而 CHANGELOG 把规则写成"cli 席…被拒绝",
+    用户会理所当然地以为 fallback 链也被覆盖了。"""
+    with pytest.raises(SystemExit) as e:
+        moa.validate_config({"members": [
+            {"name": "a", "channel": "api", "model": "openai/gpt-5.6-sol",
+             "fallback": [{"channel": "cli", "model": "gpt5.6-sol"}]}],
+            "options": {}})
+    msg = str(e.value)
+    assert "fallback" in msg and ("auggie_model" in msg and "cli_kind" in msg)
+
+
+def test_validate_config_fallback_inherits_member_auggie_model():
+    """member 上的 auggie_model 会被 merge 进 fallback({**member, **fb}),故不构成歧义——
+    门必须按 merge 后的视图判,不能只看 fb 自己写了什么。"""
+    moa.validate_config({"members": [
+        {"name": "a", "channel": "api", "model": "x", "auggie_model": "gpt5.6-sol",
+         "fallback": [{"channel": "cli", "model": "y"}]}],
+        "options": {}})
+
+
+def test_skipped_grace_record_has_usage_key():
+    """预审评审 #7: CHANGELOG 承诺"失败席产物一律带 usage 键",而 _skipped_grace 自建 dict 时漏了。
+    产物形状要一致,消费方才敢直接读 r["usage"]。"""
+    r = moa._skipped_grace({"name": "a", "seat": "A", "model": "m"})
+    assert "usage" in r and r["usage"] is None
+
+
+def test_shipped_example_config_passes_validation():
+    """出厂 config.example.yaml 必须通过全部校验门——ISSUE-008 的硬门若打到出厂配置就是回归。"""
+    cfg = yaml.safe_load((Path(moa.SKILL_ROOT) / "assets" / "config.example.yaml")
+                         .read_text(encoding="utf-8"))
+    moa.validate_config(cfg)
 
 
 # ---------- F2: cmd_refine 全席精炼失败 → 非零退出(本轮零产出) ----------
@@ -421,7 +462,7 @@ def test_resolve_config_allows_example_fallback_for_generate(tmp_path):
 
 def _capture_temp(monkeypatch):
     seen = {}
-    def fake_repair(cfg, system, user, temp, max_tokens, timeout, schema=None):
+    def fake_repair(cfg, system, user, temp, max_tokens, timeout, schema=None, **_):
         seen["temp"] = temp
         return '{"ideas":[]}', {"ideas": []}, {}
     monkeypatch.setattr(moa, "call_with_json_repair", fake_repair)
@@ -654,6 +695,49 @@ def test_stats_token_usage_billed_only():
     assert tu["prompt_tokens"] == 180
 
 
+def test_stats_token_usage_counts_successful_seats_only():
+    """token_usage 只汇总【换回了意见】的席。v1.7.0 曾加 wasted_* 汇总失败席的白花钱,
+    预审评审证明它两个方向同时错(截断重试在 call_model 循环里就丢了 usage → 21000 报成 0;
+    provider 省略 usage 时 _merge_usage({}) 全零却为真 → 没花钱的席计成 wasted_members=1),
+    故撤回。此用例钉住撤回后的口径: 失败席带 usage 也不进 token_usage,且不得冒出 wasted_* 字段——
+    一个两个方向都错的成本字段比没有更糟,用户会信它。"""
+    ok = _res("a", "A", {"verdict": "pass", "confidence": 0.5, "issues": []})
+    ok["usage"] = {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
+    burned = _res("b", "B", None, err_class="parse")      # 已计费却没产出
+    burned["usage"] = {"prompt_tokens": 60, "completion_tokens": 20, "total_tokens": 80}
+    tu = moa.compute_stats("review", [ok, burned])["token_usage"]
+    assert tu["total_tokens"] == 140          # 只算成功席
+    assert tu["billed_members"] == 1
+    assert "wasted_tokens" not in tu and "wasted_members" not in tu
+    # 逐席产物里仍尽力保留(不承诺完整), 供后续累加器重构接手
+    assert burned["usage"]["total_tokens"] == 80
+
+
+def test_stats_separates_skipped_from_real_failures():
+    """ISSUE-011: 宽限窗主动放弃的席与真故障席语义不同。members_failed 保持「全部非成功席」
+    (既有读数不变),另列 members_skipped 作子集,仲裁人可算真失败 = failed - skipped。"""
+    ok = _res("a", "A", {"verdict": "pass", "confidence": 0.5, "issues": []})
+    broke = _res("b", "B", None, err_class="server")
+    dropped = _res("c", "C", None, err_class="skipped_grace")
+    s = moa.compute_stats("review", [ok, broke, dropped])
+    assert s["members_ok"] == 1
+    assert s["members_failed"] == 2           # 含被放弃席,与旧版一致
+    assert s["members_skipped"] == 1          # 其中 1 席是主动放弃,不是故障
+    assert s["degraded"] is True
+
+
+def test_stats_roster_flags_unknown_model():
+    """ISSUE-008 配套: model_used=None(如出厂 fallback 的 cli_kind:codex + model:null)
+    意味着该席跑的是通道默认模型、家族不可知。roster 显式标 model_known=False,
+    让 synthesis.md 的家族构成披露能把这几席排除在计数外,而不是把 null 当缺数据忽略。"""
+    known = _res("a", "A", {"verdict": "pass", "confidence": 0.5, "issues": []})
+    unknown = _res("b", "B", {"verdict": "pass", "confidence": 0.5, "issues": []})
+    unknown["model_used"] = None              # codex 默认模型
+    roster = {r["name"]: r for r in moa.compute_stats("review", [known, unknown])["roster"]}
+    assert roster["a"]["model_known"] is True
+    assert roster["b"]["model_known"] is False
+
+
 # ---------- custom 模式: --members/--models(SKILL.md 承诺的入口)----------
 
 def test_build_custom_members_from_models_list():
@@ -820,6 +904,75 @@ def test_dispatch_member_grace_zero_skips_immediately_under_large_global():
     by = {r["name"]: r for r in res}
     assert by["noWait"]["err_class"] == "skipped_grace" and by["noWait"]["parsed"] is None
     assert elapsed < 1.0, f"按席 0 窗未压过全局大窗 (wall={elapsed:.1f}s)"
+
+
+# ---------- ISSUE-009: 弃席后进程快速退出(不等 atexit join 落伍线程)----------
+
+def test_abandoning_straggler_sets_fast_exit_flag(monkeypatch):
+    """弃席时置位模块标志,main() 据此跳过解释器退出阶段的线程 join。
+    实测旧行为: dispatch 已在 0.55s 返回,进程要到 6.1s 才退出(默认 timeout 下最坏 4 分钟)。"""
+    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", False)
+    members = [{"name": "fast1", "seat": "A"}, {"name": "fast2", "seat": "B"},
+               {"name": "slow", "seat": "C"}]
+
+    def fn(m):
+        if m["name"] == "slow":
+            time.sleep(0.3)
+        return {"name": m["name"], "seat": m["seat"], "parsed": {"ok": 1}, "role": "r",
+                "channel_used": "api", "latency_s": 0.0, "model_used": "m",
+                "err_class": None, "error": None}
+
+    res = moa.dispatch_with_quorum(members, fn, quorum_target=2, grace_s=0.02)
+    assert any(r["err_class"] == "skipped_grace" for r in res)
+    assert moa._ABANDONED_STRAGGLERS is True
+
+
+def test_fast_exit_never_fires_outside_the_cli_entrypoint(monkeypatch):
+    """预审评审 #5: `_ABANDONED_STRAGGLERS` 是永不复位的模块全局,已有两个 grace 测试会把它
+    留成 True 直到会话结束。今天只是潜伏——三个 main() 测试走的路径都在快速退出前返回或抛
+    SystemExit;但只要有人给 dry-run / discuss-prompt 这类【正常返回】的路径补一个 main() 测试,
+    os._exit(0) 就会在 pytest 进程里开火,**以退出码 0 杀掉测试进程**,CI 于是在跳过了剩余全部
+    用例的情况下报绿。所以快速退出必须再要求"确实是 CLI 入口",单凭 abandoned 标志不够。"""
+    killed = []
+    monkeypatch.setattr(moa.os, "_exit", lambda code: killed.append(code))
+    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", True)
+    monkeypatch.setattr(moa, "_RUNNING_AS_CLI", False)   # 库调用 / 测试直接调 main()
+    moa._fast_exit_if_stragglers()
+    assert killed == []                                  # 绝不在测试进程里开火
+    monkeypatch.setattr(moa, "_RUNNING_AS_CLI", True)    # 真正的 `python moa.py …`
+    moa._fast_exit_if_stragglers()
+    assert killed == [0]
+
+
+def test_fast_exit_purges_abandoned_cli_tmpdirs(monkeypatch, tmp_path):
+    """预审评审 #3 回归: os._exit 跳过 TemporaryDirectory 的清理 finalizer,而 CLI 席把整份
+    prompt(= 完整简报)写在该目录的 prompt.txt 里。被弃的落伍席因此会把简报留在系统临时目录——
+    v1.7.0 之前 atexit join 让线程跑完、上下文管理器自己清掉了。快速退出前必须显式清。"""
+    killed = []
+    monkeypatch.setattr(moa.os, "_exit", lambda code: killed.append(code))
+    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", True)
+    monkeypatch.setattr(moa, "_RUNNING_AS_CLI", True)
+    leaked = tmp_path / "moa_auggie_abandoned"
+    leaked.mkdir()
+    (leaked / "prompt.txt").write_text("简报正文:含待评材料", encoding="utf-8")
+    monkeypatch.setattr(moa, "_ACTIVE_CLI_TMPDIRS", {str(leaked)})
+    moa._fast_exit_if_stragglers()
+    assert killed == [0]
+    assert not leaked.exists()                # 简报不留在磁盘上
+
+
+def test_fast_exit_is_noop_without_abandoned_stragglers(monkeypatch):
+    """没弃过席就必须原样返回——否则每一次干净运行都会被 os._exit 强杀,
+    连 sys.exit 的非零码都传不出去。"""
+    killed = []
+    monkeypatch.setattr(moa.os, "_exit", lambda code: killed.append(code))
+    monkeypatch.setattr(moa, "_RUNNING_AS_CLI", True)
+    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", False)
+    moa._fast_exit_if_stragglers()
+    assert killed == []                       # 干净路径: 不碰进程
+    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", True)
+    moa._fast_exit_if_stragglers()
+    assert killed == [0]                      # 弃过席: 以 0 退出(干净路径才会走到这里)
 
 
 # ---------- main() argparse 接线冒烟(此前 0 覆盖) ----------

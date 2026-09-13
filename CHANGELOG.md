@@ -3,6 +3,138 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.7.0] — 2026-09-13
+
+Degradation-resilience pass over the three-channel fallback path, driven by three instrumented
+probes (kept in the gitignored `tasks/probes/`, re-runnable, no real requests). The probes showed
+that channel *switching* was immediate but *failure detection* was effectively unbounded, and that
+one of the two channel branches did not degrade at all.
+
+> **Upgrading from 1.6.x — read this.** Two defaults change, and both can alter what a run does.
+>
+> 1. **`timeout_seconds` now means "per fallback link", not "per HTTP attempt".** A seat that used
+>    to succeed only by burning two or three retries past its timeout can now be cut at the budget
+>    boundary and handed to the next fallback instead. **Action:** if a seat legitimately needs
+>    retry headroom, raise that seat's `timeout_seconds` — a seat's worst case is now
+>    `expanded links × timeout_seconds`, so the value is readable as a bound. Count *expanded*
+>    tries: a `cli` seat with no explicit `cli_kind` becomes two links (auggie, then codex) when
+>    both binaries are present. Every `cli` seat in the shipped config sets `cli_kind`, so there the
+>    two counts agree. Nothing to change if
+>    your seats normally answer on the first call. The first time a link is actually cut, the run
+>    prints a one-time `[budget]` note on stderr explaining this and naming the seat, so you do not
+>    have to have read this entry.
+> 2. **A `cli` seat with `model:` but no `cli_kind:` and no `auggie_model:` is now rejected at
+>    startup** instead of silently running auggie's default model. **Action:** the error names both
+>    fixes — add `auggie_model: <auggie-side id>`, or set `cli_kind: codex`/`auggie` explicitly.
+>    Every `cli` seat in the shipped `config.example.yaml` already sets `cli_kind`, so a stock
+>    config is unaffected.
+>
+> **Revert path:** no runtime opt-out flag ships for either change — both are corrections to what
+> the existing knob and the existing config already claimed to mean, and a flag would preserve the
+> silent-failure mode they remove. To go back, pin the previous release:
+> `/plugin install moa@moa-skill` after `/plugin marketplace add sdsrss/moa-skill#v1.6.2`, or for a
+> direct-copy install `git checkout v1.6.2 -- skills/moa`.
+
+### Changed
+- **`timeout_seconds` now bounds a whole fallback link, not a single HTTP attempt.** It was applied
+  per attempt and handed unchanged to every link, so `call_model`'s two internal retries multiplied
+  it: a probe with three `api` links at `timeout_seconds: 240` issued **9 HTTP attempts and could
+  run 2169 s (~36 min) for one seat**, and the quorum grace window did not help because it only
+  opens *after* quorum is reached — when two of three seats fail, it never opens at all, so the
+  bound was missing exactly when degradation mattered. Each link now gets its own wall-clock budget
+  covering its retries, backoff and JSON repair round; a link that exhausts it fails with
+  `err_class: budget` and yields to the next one. A seat's worst case is therefore `expanded links ×
+  timeout_seconds` — expanded, because a `cli` seat with no explicit `cli_kind` becomes two tries
+  (auggie, then codex) when both binaries are present; the shipped config sets `cli_kind` on every
+  `cli` seat, so there the config count and the expanded count agree. The budget is allocated
+  **per link rather than shared across the seat**, so
+  every fallback the user configured is still tried at least once. What is tightened is wall clock,
+  not retry policy: fast failures (a 429 returned immediately) consume almost no budget and still
+  get the full retry count, and the common "one call, succeeds" path is unchanged. No new config
+  option — this makes the existing knob mean what it reads like. (ISSUE-007)
+- **A `cli` seat that would run an unknown model is now rejected at config validation instead of
+  warned about.** `channel: cli` without an explicit `cli_kind` resolves to auggie when the binary
+  is present, and that path only honours `auggie_model` — so a member carrying `model:` but no
+  `auggie_model:` silently ran auggie's *default* model and recorded `model_used: null`. The cost is
+  not merely "config ignored": `references/synthesis.md` requires the arbiter to disclose each
+  seat's model family so readers can discount an "everyone agrees" result, and a seat of unknown
+  family makes that hard rule unexecutable — cross-family de-correlation is the committee's whole
+  premise, so silently running an unknown model is a correctness failure, not an acceptable
+  degradation. The error names both fixes (add `auggie_model`, or set `cli_kind` explicitly). Every
+  `cli` seat in the shipped `config.example.yaml` sets `cli_kind`, so this gate cannot fire on a
+  stock config; a test now asserts that. (ISSUE-008)
+
+### Fixed
+- **`generate` / `refine` no longer hang after they are done.** Stragglers abandoned by the grace
+  window keep running in background threads, and `concurrent.futures`' atexit handler joins them
+  at interpreter shutdown — a probe measured the dispatcher returning at 0.55 s while the process
+  only exited at 6.1 s, which at the default `timeout_seconds: 240` means up to 4 minutes of
+  silence after `done` is printed. That lands precisely where `SKILL.md` step 3 tells the arbiter to
+  background `generate` and dispatch CH1 seats in parallel, and it stalls `generate && stats`
+  chains. `main()` now exits the process directly once a straggler has been abandoned. Artifacts are
+  safe: every `write_member` happens on the main thread's `on_done` callback, so abandoned threads
+  never write files. Before exiting it also deletes the CLI channels' temp directories, which the
+  abandoned thread is parked inside and which `os._exit` would otherwise leave behind — the auggie
+  channel writes the whole briefing to `prompt.txt` in there, so skipping the cleanup would strand
+  review material in the system temp dir. Only the clean path does this — a non-zero `sys.exit`
+  still takes the regular (slower) shutdown, where the user is reading an error anyway. (ISSUE-009)
+- **`api` seats now degrade on unparseable output, like `cli` seats already did.** The two channel
+  branches of `_dispatch_channels` handled the same failure asymmetrically: when a member's output
+  could not be parsed as JSON even after the repair round, the `cli` branch raised and the seat fell
+  through to the next link in its `fallback` chain, while the `api` branch returned a `parsed=None`
+  result immediately — consuming the seat and **voiding every remaining fallback link**, so an `api`
+  seat with a configured degradation chain behaved as if it had none. The failure also recorded
+  `err_class: null`, making this class invisible to the error tally in `stats.json`, and dropped the
+  `usage` of the two calls (generate + repair) that had already been billed, so cost reporting
+  under-counted exactly when things were going wrong. The `api` branch now records a `parse`-class
+  failure carrying `usage` and `raw`, then continues down the chain. `_fail` takes optional
+  `usage` / `raw` arguments; all other call sites keep their previous shape. (ISSUE-006)
+
+  Member artifacts for failed seats now always carry a `usage` key (`null` when nothing was billed).
+  This holds even when the repair round itself raises — the generate round's already-billed `usage`
+  and its `raw` ride out on the exception rather than dying with the stack frame, which matters
+  because the per-link budget below makes "generate ate the budget, repair cannot run" a routine
+  path rather than a rare one.
+- **A failed seat's artifact now names the link that actually ran.** `_fail` built `model_used` and
+  `protocol` from the member's *primary* channel while the `raw` and `usage` it carried came from
+  whichever fallback link produced them, so one link's bytes shipped under another link's identity —
+  and `roster[].model_known` would report the config's `model` as *known* for a seat that never ran
+  it, defeating the family-composition check `references/synthesis.md` asks the arbiter to perform.
+  Failure records inside the fallback loop now carry the real link's `model_used` / `protocol` /
+  `channel_used`; the last of those also restores a field v1.6.2 populated and the first cut of this
+  release had regressed to `null`.
+
+### Added
+- **`members_skipped` separates abandonment from failure.** A seat dropped when the grace window
+  expired is a deliberate "we are not waiting for it", not a fault, but it counts in
+  `members_failed` all the same. `members_failed` keeps its old meaning (every non-successful seat)
+  so existing readings do not shift; `members_skipped` is a subset of it, and real failures are
+  `members_failed - members_skipped` without reading `err_class` seat by seat. (ISSUE-011)
+- **`roster[].model_known`** flags seats running a channel default model — `cli_kind: codex` with
+  `model: null`, the shipped fallback idiom, is one — whose family cannot be determined.
+  `synthesis.md` now tells the arbiter to exclude those seats from family counts and name them in
+  the report rather than guessing from the config. (ISSUE-008 companion)
+- **`dry-run` states that its call count is a lower bound**, naming what it excludes: JSON repair
+  rounds, transient retries (with their `max_tokens` doubling), discussion rounds, and subscription
+  seats that turn billable on degradation.
+
+### Deliberately not shipped
+- **Aggregate reporting of what failed seats burned.** This release grew `token_usage.wasted_tokens`
+  / `wasted_members` and then withdrew them before release, because pre-ship review showed the pair
+  wrong in both directions at once. Under-count: the largest single token sink in the file is
+  `call_model`'s truncation retry, which doubles `max_tokens` each attempt — measured at
+  3000 → 6000 → 12000, i.e. 21000 tokens genuinely billed across three HTTP 200s — and it discards
+  each attempt's `usage` inside its own retry loop, so the figure never reaches the aggregator and
+  reports `0`. Over-count: when a provider omits the usage block, `_merge_usage({})` yields an
+  all-zero but *truthy* dict, so a seat that was never billed is counted as a wasted member.
+  A cost field that exists to make hidden spend visible, and is wrong in both directions, is worse
+  than no field — this CHANGELOG would have been telling you to read it. The root cause is
+  structural (usage rides local variables along the normal return path, so every exception path is
+  a drop site) and patching the sites one at a time does not converge; the fix is a per-seat
+  accumulator that records spend independently of how the stack unwinds, and it gets its own
+  release. Per-seat `usage` in `member_*.json` is still preserved on a best-effort basis and makes
+  no completeness claim.
+
 ## [1.6.2] — 2026-07-13
 
 Robustness hardening from an autonomous QA self-test loop (5 rounds, black-box + white-box).

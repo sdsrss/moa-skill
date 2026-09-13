@@ -20,9 +20,11 @@ moa.py — MoA 委员会分发器 (M2: CH2 codex CLI + CH3 API 双通道)
 """
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -253,22 +255,42 @@ def classify_http_error(e: urllib.error.HTTPError) -> Exception:
 _MAX_TOKENS_CEILING = 16000
 
 
+def _remaining(deadline) -> float:
+    """距 deadline(time.monotonic 基准)还剩几秒;已过期返回 0。"""
+    return max(0.0, deadline - time.monotonic())
+
+
 def call_model(cfg: dict, system: str, user: str, temperature: float,
-               max_tokens: int, timeout: int, retries: int = 2) -> tuple[str, dict]:
+               max_tokens: int, timeout: int, retries: int = 2, deadline=None) -> tuple[str, dict]:
     """瞬态错误指数退避重试;永久错误立即抛出。空响应视为瞬态(Gemini 配额耗尽会静默吞 JSON)。
     截断修复(mem #10216): 推理模型(gemini-3.1-pro/gpt-5.6-sol)在 max_tokens 偏小时 reasoning
     吃光额度,content 空壳且 finish_reason=length——原样重试必然复现,故重试时倍增预算
-    (封顶 _MAX_TOKENS_CEILING);末次仍截断但有内容则尽力返回,交上层 parse/修复轮抢救。"""
+    (封顶 _MAX_TOKENS_CEILING);末次仍截断但有内容则尽力返回,交上层 parse/修复轮抢救。
+
+    deadline(修 ISSUE-007): 本条 fallback 链的挂钟到期时刻(time.monotonic 基准)。每次尝试与
+    每次退避都不得越过它——否则单条链的 retries 会吃光整席时间,后面配好的降级通道一次都轮不到
+    (实测 3 条 api 链 × 3 次尝试 × 240s = 2169s ≈ 36 分钟)。收紧的是【挂钟】不是【重试策略】:
+    快速失败(如 429 秒回)时预算几乎不消耗,重试次数与旧版一致。None = 不设限(直接调用本函数
+    的库/测试保持旧行为)。"""
     url, headers = endpoint_and_headers(cfg)
     last_err = None
     cur_max = max_tokens
     for attempt in range(retries + 1):
+        budget = timeout if deadline is None else min(timeout, _remaining(deadline))
+        if budget <= 0:
+            # 分类记 budget 而非底层 last_err(如裸 TimeoutError): 两者要的动作不同——
+            # timeout 说"这个端点慢", budget 说"这条链的时间用完了, 要么调大 timeout_seconds
+            # 要么接受它让位给下一条 fallback"。底层原因不丢, 写进消息里。
+            raise TransientError(
+                f"link wall-clock budget exhausted after {attempt} attempt(s)"
+                + (f"; last error: {last_err}" if last_err else ""),
+                err_class="budget")
         try:
             data = http_post(url, headers, {
                 "model": cfg["model"], "max_tokens": cur_max,
                 "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": user}]}, timeout)
+                             {"role": "user", "content": user}]}, budget)
             choice = (data.get("choices") or [{}])[0]
             content = choice.get("message", {}).get("content", "") or ""
             finish = choice.get("finish_reason") or choice.get("native_finish_reason") or ""
@@ -290,7 +312,11 @@ def call_model(cfg: dict, system: str, user: str, temperature: float,
         except (urllib.error.URLError, TimeoutError, ConnectionError, TransientError) as e:
             last_err = e
         if attempt < retries:
-            time.sleep(2 ** attempt)
+            nap = 2 ** attempt
+            if deadline is not None:          # 退避也不得越过链预算, 否则光睡就能把时间睡光
+                nap = min(nap, _remaining(deadline))
+            if nap > 0:
+                time.sleep(nap)
     raise last_err if last_err else TransientError("unknown failure")
 
 
@@ -327,21 +353,49 @@ def parse_json(text: str):
     return None
 
 
-def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=None):
+def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=None, deadline=None):
     """输出偶尔带解释性文字致 JSON 解析失败。花一次小成本让它自修复,而非丢弃该视角。
-    schema 可为 None(system 里已含 schema 描述时),修复提示不重复附加。"""
-    raw, usage = call_model(cfg, system, user, temp, max_tokens, timeout)
+    schema 可为 None(system 里已含 schema 描述时),修复提示不重复附加。
+    deadline: 与生成轮共享同一条链的挂钟预算(修 ISSUE-007)——修复轮吃的是这条链剩下的时间,
+    剩余为 0 时 call_model 直接以 budget 类错误退出,把机会让给下一条 fallback。"""
+    raw, usage = call_model(cfg, system, user, temp, max_tokens, timeout, deadline=deadline)
     parsed = parse_json(raw)
     if parsed is not None:
         return raw, parsed, usage
-    repair, usage2 = call_model(
-        cfg,
-        "你上一次的输出不是合法 JSON。把其中的实质内容原样转成合法 JSON,不要增删观点,不要解释。" + (schema or ""),
-        f"你上一次的输出:\n{raw}", 0.0, max_tokens, timeout)
+    try:
+        repair, usage2 = call_model(
+            cfg,
+            "你上一次的输出不是合法 JSON。把其中的实质内容原样转成合法 JSON,不要增删观点,不要解释。" + (schema or ""),
+            f"你上一次的输出:\n{raw}", 0.0, max_tokens, timeout, deadline=deadline)
+    except Exception as e:
+        # 修复轮抛错时,生成轮【已经计费】的 usage/raw 会随栈帧一起消失(预审评审 #1)。
+        # ISSUE-007 之后这是常见路径而非罕见路径: 生成轮吃光链预算 → 修复轮的 budget<=0
+        # 守卫立刻抛 → 每个"慢且吐垃圾"的席都漏账,正是 ISSUE-006/010 要关的那个洞。
+        # 挂到异常上由 _dispatch_channels 取回: err_class 保持真实原因(budget/auth/…),账不漏。
+        e.usage = _merge_usage(usage)
+        e.raw = raw
+        raise
     return raw, parse_json(repair), _merge_usage(usage, usage2)
 
 
 # ---------- CH2: codex CLI 通道 ----------
+
+# 在跑的 CLI 临时目录。快速退出(_fast_exit_if_stragglers)会绕过 TemporaryDirectory 的清理
+# finalizer,故需登记在册显式清掉——目录里有 auggie 席写的完整简报(预审评审 #3)。
+_ACTIVE_CLI_TMPDIRS = set()
+
+
+@contextlib.contextmanager
+def _cli_tmpdir(prefix):
+    """CLI 通道的临时目录 + 在册登记。正常路径仍由 TemporaryDirectory 自己清理,
+    本包装只负责登记/注销,让 os._exit 前有办法把被弃席的目录一并清掉。
+    set.add/discard 在 GIL 下是原子操作,worker 线程并发登记无需额外加锁。"""
+    with tempfile.TemporaryDirectory(prefix=prefix) as td:
+        _ACTIVE_CLI_TMPDIRS.add(td)
+        try:
+            yield td
+        finally:
+            _ACTIVE_CLI_TMPDIRS.discard(td)
 
 def call_cli_codex(cfg, system, user, timeout):
     """codex exec 非交互调用(codex-cli 0.144+):
@@ -358,7 +412,7 @@ def call_cli_codex(cfg, system, user, timeout):
     # schema 靠 prompt 约束 + parse_json 提取(与 api 路径一致)。不用 codex --output-schema:
     # OpenAI 严格模式要求 additionalProperties:false 且全字段 required,对自由形状过重(moa-x 教训)。
     prompt = f"{system}\n\n---\n\n{user}\n\n只输出 JSON,不要任何其他文字。"
-    with tempfile.TemporaryDirectory(prefix="moa_codex_") as td:
+    with _cli_tmpdir("moa_codex_") as td:
         last_msg = Path(td) / "last.txt"
         # 命令始终内部构建,保证 --output-last-message 指向内部临时路径;
         # member.cli_extra 追加额外 flag(如 -c model_reasoning_effort=...)。model 可省(用 codex 默认)。
@@ -408,7 +462,7 @@ def call_cli_auggie(cfg, system, user, timeout):
         raise PermanentError(f"{auggie_bin} not found on PATH", err_class="startup",
                              hint="install auggie, or set member.auggie_bin / cli_kind: codex")
     prompt = f"{system}\n\n---\n\n{user}\n\n只输出 JSON,不要任何其他文字。"
-    with tempfile.TemporaryDirectory(prefix="moa_auggie_") as td:
+    with _cli_tmpdir("moa_auggie_") as td:
         ws = Path(td) / "ws"
         ws.mkdir()
         pf = Path(td) / "prompt.txt"
@@ -537,6 +591,19 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
     t0 = time.time()
     last = None
     for kind, ccfg, note in tries:
+        # 每条 fallback 链各自一份挂钟预算(修 ISSUE-007): timeout_seconds 的语义从「每次 HTTP
+        # 尝试」收紧为「这条链的总挂钟」,覆盖它的重试与 JSON 修复轮。单席上界因此收敛到
+        # 展开后链数 × timeout(此前是 链数 × (1+retries) × timeout,默认阵容 A 席最坏 36 分钟;
+        # 数的是 resolve_channel 展开【后】的尝试数——auto 的 cli 席会展开成 auggie+codex 两条),
+        # 而「一次调用即成功」的常见路径耗时完全不变。链长是用户在 config 里显式写出的意图,
+        # 所以预算按链分配、不做全席共享——保证每条配好的降级通道都至少被试一次。
+        link_deadline = time.monotonic() + timeout
+        # 实跑链的身份, 成功与失败共用(预审评审 #2): 失败产物若记主通道的 model,
+        # 就等于把这条链的 raw/usage 挂在别条链名下, roster 会报出 config 的 model 并标成可知。
+        link_model = ccfg.get("model")
+        link_protocol = ccfg.get("protocol", "-" if kind == "cli" else "openrouter")
+        link_label = (f"cli:{ccfg.get('cli_kind', 'codex')}" if kind == "cli" else kind) \
+            + (f" ({note})" if note else "")
         try:
             if kind == "cli":
                 ckind = ccfg.get("cli_kind", "codex")
@@ -544,31 +611,75 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
                 raw, parsed = fn(ccfg, system, user, timeout)
                 usage = None  # cli 通道无 usage 折算(codex 走订阅;auggie 在 Augment 侧结算)
                 if parsed is None:  # 解析失败先给一次 CLI 修复轮(对齐 api 路径),仍失败才交 fallback
-                    _, parsed = _cli_json_repair(fn, ccfg, raw, timeout)
+                    rem = _remaining(link_deadline)
+                    if rem <= 0:    # 首轮已用满本链预算: 不再开修复轮, 把时间让给下一条 fallback
+                        raise TransientError(
+                            f"{ckind} output not valid JSON and link budget exhausted "
+                            f"(no time left for a repair round)", err_class="budget")
+                    _, parsed = _cli_json_repair(fn, ccfg, raw, rem)
                     if parsed is None:
                         raise TransientError(f"{ckind} output not valid JSON after repair",
                                              err_class="parse")
             else:
                 raw, parsed, usage = call_with_json_repair(
                     ccfg, system, user, member.get("temperature_generate", default_temp),
-                    opts["max_tokens_member"], timeout, None)
-            label = f"cli:{ccfg.get('cli_kind', 'codex')}" if kind == "cli" else kind
+                    opts["max_tokens_member"], timeout, None, deadline=link_deadline)
+                if parsed is None:
+                    # 与 cli 分支对齐(修 ISSUE-006): 修复轮后仍不可解析 = 这条通道没产出可用意见,
+                    # 必须继续降级。旧代码在此直接 return parsed=None 占掉整席,后续 fallback 全部
+                    # 作废——配了降级链的 api 席等于没配,且 err_class 记 None 让错误分类对这类失败
+                    # 失明。usage/raw 随失败结果带走: 这两次调用已真实计费,丢了就在出问题时低估
+                    # 成本最多;raw 留给人工抢救模型到底说了什么。
+                    last = _fail(member, role_key,
+                                 f"api output not valid JSON after repair "
+                                 f"(model={link_model})",
+                                 "parse", t0, usage=usage, raw=raw,
+                                 model_used=link_model, channel_used=link_label,
+                                 protocol=link_protocol)
+                    continue
             return {
                 "name": member["name"], "seat": seat, "role": role_key,
-                "model_used": ccfg.get("model"),  # codex 席可省 model(用 codex 默认)→ None,非 KeyError
-                "protocol": ccfg.get("protocol", "-" if kind == "cli" else "openrouter"),
-                "channel_used": label + (f" ({note})" if note else ""),
+                "model_used": link_model,  # codex 席可省 model(用 codex 默认)→ None,非 KeyError
+                "protocol": link_protocol,
+                "channel_used": link_label,
                 "raw": raw, "parsed": parsed, "usage": usage, "latency_s": round(time.time() - t0, 1),
                 "error": None if parsed else "output not parseable", "err_class": None,
             }
         except PermanentError as e:
-            last = _fail(member, role_key, f"{e} [{e.err_class}] {e.hint}".strip(), e.err_class, t0)
+            last = _fail(member, role_key, f"{e} [{e.err_class}] {e.hint}".strip(), e.err_class, t0,
+                         usage=getattr(e, "usage", None), raw=getattr(e, "raw", ""),
+                         model_used=link_model, channel_used=link_label, protocol=link_protocol)
             continue  # 永久错误: 直接试下一个 fallback,不重试
         except Exception as e:
             ec = getattr(e, "err_class", "unknown")
-            last = _fail(member, role_key, f"{e} [{ec}]", ec, t0)
+            if ec == "budget":
+                _warn_budget_semantics_once(member, timeout)
+            # usage/raw 可能由 call_with_json_repair 挂在异常上(预审评审 #1): 生成轮已计费、
+            # 修复轮抛错时, 账与原始输出都在这里取回, 不随栈帧丢掉。
+            last = _fail(member, role_key, f"{e} [{ec}]", ec, t0,
+                         usage=getattr(e, "usage", None), raw=getattr(e, "raw", ""),
+                         model_used=link_model, channel_used=link_label, protocol=link_protocol)
             continue
     return last or _fail(member, role_key, "all channels failed", "unknown", t0)
+
+
+_budget_hint_shown = False
+
+
+def _warn_budget_semantics_once(member, timeout):
+    """链预算首次真的砍掉一条通道时,到 stderr 说明一次语义变更(v1.7.0 可发现性信号)。
+
+    ISSUE-007 改的是既有旋钮的含义,是【静默】的用户可见行为变更: 升级前某席靠重试熬到第 2、3 次
+    才成功的,升级后可能在预算边界被判失败。不读 CHANGELOG 的人得有办法当场看懂发生了什么、
+    以及怎么调回去,所以在这里印一次(每进程一次,不刷屏)。"""
+    global _budget_hint_shown
+    if _budget_hint_shown:
+        return
+    _budget_hint_shown = True
+    print(f"[budget] v1.7.0 起 timeout_seconds 是【每条 fallback 链】的挂钟预算(含该链的重试与 "
+          f"JSON 修复轮),不再是每次 HTTP 尝试。{member['name']} 的一条链用满 {timeout}s 被中止,"
+          f"已让位给下一条 fallback。要给这条链更多重试余量就调大该席的 timeout_seconds;"
+          f"单席最坏耗时 = 展开后的链数 × timeout_seconds。", file=sys.stderr)
 
 
 def _cli_json_repair(fn, ccfg, raw, timeout):
@@ -704,11 +815,26 @@ def _turn_envelope(res: dict, round_no: int) -> dict:
     }
 
 
-def _fail(member, role_key, msg, err_class, t0=None):
+_UNSET = object()
+
+
+def _fail(member, role_key, msg, err_class, t0=None, usage=None, raw="",
+          model_used=_UNSET, channel_used=None, protocol=_UNSET):
+    """失败席结果。
+
+    usage/raw(修 ISSUE-006): 已发出并计费的调用即便产出不可用,也要把 token 用量与原始文本留在
+    产物里——否则成本统计恰在出问题时低估得最多,且人工无从判断模型究竟返回了什么。
+
+    model_used/channel_used/protocol(预审评审 #2): 默认取 member 的【主通道】身份,但失败发生在
+    fallback 链上时,raw/usage 来自实际跑的那条链——把一条链的字节挂在另一条链的名字下,会让
+    `roster[].model_known` 报出 config 里写的 model 并标成"可知",而 synthesis.md 要求仲裁人按
+    roster 逐席核对家族、明确不许按 config 推断。故链内失败一律显式传入实跑链的身份。
+    channel_used 默认 None 保持其余调用点(如纯 subagent 席跳过)的旧形状。"""
     return {
         "name": member["name"], "seat": member.get("seat", "?"), "role": role_key,
-        "model_used": member.get("model"), "protocol": member.get("protocol", "openrouter"),
-        "channel_used": None, "raw": "", "parsed": None,
+        "model_used": member.get("model") if model_used is _UNSET else model_used,
+        "protocol": member.get("protocol", "openrouter") if protocol is _UNSET else protocol,
+        "channel_used": channel_used, "raw": raw, "parsed": None, "usage": usage,
         "latency_s": round(time.time() - t0, 1) if t0 else 0.0,
         "error": msg, "err_class": err_class,
     }
@@ -730,6 +856,42 @@ DEFAULT_SEAT_ROLE = {
 
 
 # ---------- 并行执行 + 产物落盘 ----------
+
+# 本进程是否弃置过落伍席。置位后 main() 在干净路径上走快速退出(修 ISSUE-009)。
+_ABANDONED_STRAGGLERS = False
+# 是否真的以 `python moa.py …` 在跑。只有 __main__ 块会置 True(预审评审 #5)——
+# 本标志永不复位,而测试会在 dispatch 里把它设成 True 并留到会话结束;没有这道闸,
+# 将来给 dry-run/discuss-prompt 这类正常返回的路径补一个 main() 测试,os._exit(0) 就会
+# 在 pytest 进程里开火并以【退出码 0】杀掉它 —— CI 在跳过剩余全部用例的情况下报绿。
+_RUNNING_AS_CLI = False
+
+
+def _fast_exit_if_stragglers():
+    """弃过落伍席时,干净路径上跳过解释器退出阶段直接结束进程(修 ISSUE-009)。
+
+    被弃的落伍线程仍在后台跑,`concurrent.futures` 的 atexit 会在解释器退出时 join 它们——
+    实测 dispatch_with_quorum 已在 0.55s 返回,进程却到 6.1s 才退出;按默认 timeout_seconds=240
+    最坏要多等 4 分钟。SKILL.md 第 3 步恰好推荐「后台起 generate,同时派发 CH1 子代理」,
+    这段静默等待正好卡在两边合流之前,`generate && stats` 这类串联也会平白挂住。
+
+    产物安全: 所有 write_member 都在主线程的 on_done 回调里完成,落伍线程从不写文件,故此处
+    强杀不会截断任何产物;只需先 flush 自己的 stdio。
+
+    只在干净路径做: sys.exit(非零) 抛的 SystemExit 会越过这里走常规(慢)退出——那条路上用户
+    正在读错误信息,慢一点可接受,换来不必自己重实现 sys.exit 的消息打印语义。
+    只由 main() 调用: 放进 cmd_* 会让直接调用这些函数的测试把 pytest 进程一起杀掉。"""
+    if not (_RUNNING_AS_CLI and _ABANDONED_STRAGGLERS):
+        return
+    # 被弃线程正停在 CLI 通道的 `with tempfile.TemporaryDirectory(...)` 里, os._exit 会跳过它的
+    # 清理 finalizer —— 而 call_cli_auggie 把整份 prompt(= 完整简报)写在该目录的 prompt.txt。
+    # 不显式清就等于把待评材料留在系统临时目录(预审评审 #3;v1.7.0 之前 atexit join 让线程
+    # 自己跑完、上下文管理器清掉了)。落伍席的结果本就丢弃, 强删不影响任何产物。
+    for d in list(_ACTIVE_CLI_TMPDIRS):
+        shutil.rmtree(d, ignore_errors=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 
 def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     """Quorum 宽限窗(design.md §10): 存活委员数达 quorum_target 后,给仍在跑的落伍者
@@ -790,6 +952,8 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                     fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
                     pending.discard(fut)
                     abandoned = True
+                    global _ABANDONED_STRAGGLERS   # 供 main() 干净路径上的快速退出(修 ISSUE-009)
+                    _ABANDONED_STRAGGLERS = True
     finally:
         # abandoned=True → wait=False 立即交还控制权(不 join 落伍线程); 正常完成 → wait=True。
         ex.shutdown(wait=not abandoned)
@@ -801,7 +965,7 @@ def _skipped_grace(member):
     return {
         "name": member["name"], "seat": member.get("seat", "?"), "role": role_key,
         "model_used": member.get("model"), "protocol": member.get("protocol", "openrouter"),
-        "channel_used": None, "raw": "", "parsed": None, "latency_s": 0.0,
+        "channel_used": None, "raw": "", "parsed": None, "usage": None, "latency_s": 0.0,
         "error": "skipped: quorum reached, grace period expired", "err_class": "skipped_grace",
     }
 
@@ -836,7 +1000,15 @@ def load_members(collect_dir: Path, round_no: int = 0):
 
 def _aggregate_usage(ok_results: list) -> dict:
     """汇总本轮计费席(CH3 API)的 token 用量;订阅席(CH1/CH2)usage=None 不计入。
-    billed_members 为有 usage 的席位数,供成本折算与倍数计算用。"""
+    billed_members 为有 usage 的席位数,供成本折算与倍数计算用。
+
+    失败席已计费但没换回意见的花销【不在此处汇总】。v1.7.0 曾加过 wasted_tokens/wasted_members
+    两个字段,预审评审证明它两个方向同时错而被撤回: ① 最大的单个 token 消耗点——call_model
+    截断重试(实测 3000→6000→12000,合计 21000)——在重试循环里就把 usage 丢了,根本到不了这里,
+    于是报 0;② provider 省略 usage 时 _merge_usage({}) 产出全零【但为真】的 dict,使没花钱的席
+    被计成 wasted_members=1。根因是 usage 靠局部变量沿正常返回路径传递,每条异常路径都是丢弃点,
+    逐点打补丁修不完。正确修法是逐席累加器(栈怎么展开都不影响已记的账),留到后续版本单独做。
+    逐席产物里的 usage 仍尽力保留(见 _fail),但那是尽力而为,不对外承诺完整性。"""
     billed = [r for r in ok_results if r.get("usage")]
     agg = _merge_usage(*(r["usage"] for r in billed))
     agg["billed_members"] = len(billed)
@@ -886,12 +1058,24 @@ def _str(v) -> str:
 def compute_stats(mode: str, results: list) -> dict:
     ok = [r for r in results if _parsed_ok(r)]
     failed = [r for r in results if not _parsed_ok(r)]
+    # members_skipped(修 ISSUE-011): 宽限窗到期被【主动放弃】的席与真失败席语义不同——前者是
+    # "达法定数后不再等它", 后者是"它坏了"。dispatch_with_quorum 的 docstring 说 skipped_grace
+    # "不算失败", 那只在 cmd_generate 的 min_ok 止损门这个意义上成立; 这里它 parsed=None, 一直
+    # 计入 members_failed。保持 members_failed = 全部非成功席(既有读数不变), 另列 members_skipped
+    # 作为其子集, 仲裁人据此算真失败 = members_failed - members_skipped, 不必去逐条读 err_class。
+    skipped = [r for r in failed if r.get("err_class") == "skipped_grace"]
     base = {
         "degraded": len(failed) > 0,
         "members_ok": len(ok),
-        "members_failed": len(failed),
+        "members_failed": len(failed),          # 含 members_skipped
+        "members_skipped": len(skipped),        # 主动放弃(宽限窗到期), 非故障
         "roster": [{"name": r["name"], "seat": r.get("seat"),
                     "model_used": r.get("model_used"), "channel_used": r.get("channel_used"),
+                    # model_known(修 ISSUE-008): model_used=None 意味着这席跑的是通道默认模型
+                    # (如 cli_kind: codex + model: null 这个出厂 fallback 写法), 家族不可知。
+                    # synthesis.md 要求按各席家族构成折算"全员一致"的分量, 这个标记让仲裁人
+                    # 一眼看出哪几席算不进家族计数, 而不是把 null 当成缺数据忽略掉。
+                    "model_known": r.get("model_used") is not None,
                     "ok": _parsed_ok(r)} for r in results],
         "failures": [{"name": r["name"], "err_class": r.get("err_class"), "error": r.get("error")}
                      for r in failed],
@@ -971,10 +1155,11 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
     """精炼轮统计(design.md §7.3): 三态计票、一票 challenge 锁 disputed、谄媚计数器、早停信号。
     prior_results = 上一轮(生成或前一精炼轮)产物;refine_results = 本精炼轮产物。"""
     ok = [r for r in refine_results if _parsed_ok(r)]
+    rd_failed = [r for r in refine_results if not _parsed_ok(r)]
     base: dict = {
         "round_members_ok": len(ok),
-        "round_members_failed": len(refine_results) - len(ok),
-        "token_usage": _aggregate_usage(ok),  # 本精炼轮计费席 token 增量,供成本增量观测
+        "round_members_failed": len(rd_failed),
+        "token_usage": _aggregate_usage(ok),   # 本精炼轮计费席 token 增量,供成本增量观测
     }
     if mode == "review":
         stance = {"validate": 0, "challenge": 0, "abstain": 0}
@@ -1232,6 +1417,9 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
     print(f"\n外部委员调用数 = {n} 席 × {total_calls_each}(生成+精炼) = {n * total_calls_each}")
     print(f"  其中计费通道(CH3 api / CH2 auggie=上游价+40%): {api_calls_billed} 席 × {total_calls_each} = {api_calls_billed * total_calls_each} 次")
     print(f"  订阅通道(CH1 subagent / CH2 codex): {api_calls_sub} 席 × {total_calls_each} = {api_calls_sub * total_calls_each} 次(只计次数,不折算美元)")
+    print("  ↑ 这是【下界】: 不含 JSON 修复轮(每席最多 +1 次调用)、瞬态重试(每次 api 调用最多 +2 次,"
+          "截断重试还会倍增 max_tokens)、以及开会讨论轮(按回合计,n 席 × m 轮,不在此式内)。"
+          "首选订阅席若降级到计费通道,计费面也会比上面这行大。")
     print("收敛由当前 agent(仲裁人)完成,不计外部调用。")
     print(f"proxy: {'via ' + str(PROXIES) if PROXIES else 'no env proxy, direct'}")
     warn_sensitive_material(material)  # 外发前敏感信息扫描,检出即脱敏告警
@@ -1290,6 +1478,15 @@ def validate_config(cfg):
         # 反把它秒弃。未设(None)= 用默认, 合法。bool 是 int 子类但语义非秒数, 一并拒。
         return v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0)
 
+    def _ambiguous_auto_cli(view):
+        """该通道视图是否会"跑一个不可知的模型": channel=cli + 未写 cli_kind(=auto) + 设了 model
+        但无 auggie_model。auto 路径检测到 auggie 即优先,且只认 auggie_model,于是 model 被静默
+        忽略、auggie 用自己的默认模型顶替、model_used 记 None。传入的可以是 member,也可以是
+        {**member, **fallback} 的 merge 视图——两者走的是同一套展开逻辑。"""
+        return bool(view.get("channel", "api") == "cli"
+                    and view.get("cli_kind", "auto") == "auto"
+                    and view.get("model") and not view.get("auggie_model"))
+
     def _bad_pos(v):
         # timeout_seconds / max_tokens_member 进 subprocess/socket timeout 与 API max_tokens、并在
         # 截断重试里做 `cur_max * 2` / `min(cur_max, CEIL)` 算术与比较: YAML 手误引号化(如 "5")会裸
@@ -1311,14 +1508,31 @@ def validate_config(cfg):
         ck = m.get("cli_kind", "auto")
         if ck not in ("auto", "codex", "auggie"):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) cli_kind={ck!r} 非法(应为 auto/codex/auggie)")
-        # 告警(不阻断,修 F5): channel=cli + auto(默认)+ 设了 model 但无 auggie_model 时,
-        # 检测到 auggie 会优先走 auggie 且只认 auggie_model(两侧 ID 命名空间不同),member.model 被
-        # 静默忽略、auggie 用其默认模型顶替——委员构成偏离配置意图且 model_used 记 None。指名提示。
-        if ch == "cli" and ck == "auto" and m.get("model") and not m.get("auggie_model"):
-            print(f"[config] ⚠ members[{i}] ({m.get('name')}) channel=cli 未显式 cli_kind(=auto),"
-                  f"检测到 auggie 时优先走 auggie 且只认 auggie_model;你设了 model={m['model']!r} 但无 "
-                  f"auggie_model,auggie 路径会用其默认模型顶替。要精确控制请显式 cli_kind 或补 auggie_model。",
-                  file=sys.stderr)
+        # 拒绝启动(修 ISSUE-008;原 F5 只打告警): channel=cli + auto(默认)+ 设了 model 但无
+        # auggie_model 时,检测到 auggie 会优先走 auggie 且只认 auggie_model(两侧 ID 命名空间不同),
+        # member.model 被静默忽略、auggie 用其默认模型顶替,产物里 model_used 记 None。
+        # 升级为硬门的理由不是「配置没生效」,而是这一席会跑一个【不可知的模型】:synthesis.md 要求
+        # 仲裁人披露各席家族构成来折算「全员一致」的分量,未知模型让那条收敛硬规则不可执行——而跨家族
+        # 去相关正是本委员会的立身之本,静默跑错模型是正确性失败,不是可接受的降级。
+        # 出厂 config.example.yaml 的 cli 席都显式写了 cli_kind,故此门打不到任何出厂配置,
+        # 只打到本就已在静默跑错模型的手写配置。
+        if _ambiguous_auto_cli(m):
+            sys.exit(f"[config] members[{i}] ({m.get('name')}) channel=cli 未写 cli_kind(=auto),"
+                     f"检测到 auggie 时会优先走 auggie 且只认 auggie_model——你设的 "
+                     f"model={m['model']!r} 会被静默顶替成 auggie 的默认模型,该席家族构成不可知。"
+                     f"二选一修好: ① 补 auggie_model: <auggie 侧 ID>(auggie models list 查);"
+                     f"② 显式 cli_kind: codex 或 auggie(显式时直接用 model,不需要 auggie_model)。")
+        # fallback 链走的是同一套展开(resolve_channel 内 {**member, **fb} 再进 _expand_cli),
+        # 所以同样会静默顶替模型;此前此门只看顶层 member,fallback 里的 cli 链是漏的
+        # (预审评审 #4)。按 merge 后的视图判——member 上的 auggie_model 会被继承,不算歧义。
+        for j, fb in enumerate(m.get("fallback", []) or []):
+            if isinstance(fb, dict) and _ambiguous_auto_cli({**m, **fb}):
+                merged_model = {**m, **fb}.get("model")
+                sys.exit(f"[config] members[{i}] ({m.get('name')}) 的 fallback[{j}] channel=cli "
+                         f"未写 cli_kind(=auto): 降级到这条链时会优先走 auggie 且只认 auggie_model,"
+                         f"model={merged_model!r} 会被静默顶替成 auggie 默认模型,该席家族不可知。"
+                         f"与主通道同样二选一: ① 给这条 fallback 补 auggie_model;"
+                         f"② 显式写 cli_kind: codex 或 auggie。")
         if _bad_grace(m.get("grace_seconds")):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) grace_seconds="
                      f"{m.get('grace_seconds')!r} 非法(应为非负数值秒数,如 150 或 90.0)")
@@ -1756,7 +1970,9 @@ def main():
      "discuss-turn": cmd_discuss_turn, "discuss-prompt": cmd_discuss_prompt,
      "discuss-blindvote": cmd_discuss_blindvote,
      "dry-run": cmd_dry_run}[args.phase](args, cfg)
+    _fast_exit_if_stragglers()   # 弃过落伍席时不等后台线程收尾(修 ISSUE-009)
 
 
 if __name__ == "__main__":
+    _RUNNING_AS_CLI = True   # 只有真 CLI 进程才允许快速退出开火(预审评审 #5)
     main()

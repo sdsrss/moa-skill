@@ -7,7 +7,9 @@ description: MoA multi-model committee — you (the arbiter) chair up to 4 heter
 
 把多个异构大模型组成"委员会":委员互相隔离、各领角色独立盲审,当前 agent 作为仲裁人按硬规则收敛。原理基于 Mixture-of-Agents——不同模型盲点不同,独立盲审 + 结构化聚合能突破单模型上限。角色契约、收敛硬规则与简报模板见本目录 `references/`。
 
-> **实现状态:v1.6.2**。已可用:三通道(CH2 CLI:auggie/codex,检测到 auggie 优先 + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗(可按席覆盖 `grace_seconds`)、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex+auggie(v1.4.0 auggie 双席实跑 2/2,含 auto 检测)/ CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
+> **实现状态:v1.7.0**。已可用:三通道(CH2 CLI:auggie/codex,检测到 auggie 优先 + CH3 API + CH1 子代理)、fallback 降级链、Quorum 宽限窗(可按席覆盖 `grace_seconds`)、degraded 标记、**评审/决策/头脑风暴三场景**、**精炼轮(匿名互评三态契约 / 决策交叉审查 / 谄媚计数器 / 早停信号)**、**开会讨论(L3:顺序发言 + 发言序轮转 / 从众计数 / 假讨论检测 / 收尾盲投漂移检测)**、主席综合/仲裁/策展、auto 路由 + **开会讨论 L3 选路门(三条硬门:L3 + 根本分歧 + 用户显式要求)**、dry-run、按模式统计(含 token 用量)、错误分类、**敏感材料外发前告警 + `leak-check` 密钥泄漏静态自查**、成本实测(4.79×,见 README)、触发用例集 + auto 路由用例集(五场景×流水线)、`.claude-plugin/plugin.json` 分发清单。**真实端到端验证覆盖**:三通道(CH1 子代理 / CH2 codex+auggie(v1.4.0 auggie 双席实跑 2/2,含 auto 检测)/ CH3 API)、评审/决策/头脑风暴、开会讨论(2 轮 + 盲投)、Self-MoA、故障注入(重试/JSON修复/中止)、**auto 顶配实跑(4 席三通道;第 4 席因测试 key 无 xAI 供给用了第二个 OpenAI 模型,非完全异构)**;顶配模型/代理 slug 核对见 `assets/config.example.yaml`。
+>
+> **v1.7.0 变更**(降级韧性;**含两处默认行为变更**):① 修 api 席在"输出不可解析"上**不降级**的真 bug——cli 分支 raise→降级、api 分支 return→占席,配了 fallback 的 api 席等于没配(ISSUE-006);② **`timeout_seconds` 语义改为「每条 fallback 链」的挂钟预算**(含该链的重试与修复轮),单席最坏耗时从 `链长 × (1+retries) × timeout`(实测 3 链 240s = 36 分钟)收敛到 `展开后链数 × timeout`;被预算切断时 `err_class=budget` 并印一次性 stderr 说明(ISSUE-007);③ **`channel: cli` 未写 `cli_kind` 又只有 `model` 的席改为拒绝启动**——它会静默跑 auggie 默认模型、`model_used` 记 None,使 `synthesis.md` 的家族构成披露不可执行(出厂 config 全部显式写了 `cli_kind`,不受影响)(ISSUE-008);④ 弃席后进程快速退出,不再等 atexit join 落伍线程(实测 0.55s 返回 / 6.1s 才退出)(ISSUE-009);⑤ stats 新增 `members_skipped`(主动放弃≠故障)与 `roster[].model_known`(家族是否可知)。dry-run 明示其调用数为下界。**失败席白花的计费仍未汇总**:本轮曾加 `wasted_*`,预审评审证明它两个方向同时错(截断重试在 `call_model` 循环内就丢了 usage;provider 省略 usage 时全零 dict 却为真)而撤回,待后续版本用逐席累加器重做。tests 209→228。
 >
 > **v1.6.2 变更**(自测循环健壮性加固,向后兼容):合法配置/正常委员输出**行为不变**。修 5 个问题——① `parse_json` 收紧为 dict-or-None,聚合层独立 `isinstance(dict)` 门:委员输出为非对象 JSON(数组/标量)不再崩 `stats`;② 嵌套字段类型守卫(`issues`/`ideas`/`confidence` 等写成字符串/异型不再崩聚合);③ 数值 config 选项(`min_successful_members`/`timeout_seconds`/`max_tokens_member`)补类型校验(对齐 v1.6.1 的 grace);④ **discuss 强制 seat 唯一**(seat 是讨论里的匿名发言者身份;重复 seat 会静默丢席/歧义。generate/refine 仍允许重复 seat);⑤ 缺 `--input`/`--inject` 文件给具名报错而非 traceback。tests 177→209。
 >
@@ -64,12 +66,14 @@ python skills/moa/scripts/moa.py stats --mode review --collect-dir moa-reports/r
 `moa.py` 只跑 `channel: api`(CH3)与 `channel: cli`(CH2:`cli_kind: auggie/codex`,省略 = auto 检测到 auggie 优先;auggie 计费 = 上游价 +40%,codex 走订阅)席位;**纯** `channel: subagent`(CH1、无 api/cli fallback)席位它会跳过并提示。注意:若某 subagent 席挂了 api/cli fallback,moa.py 会判它可派发并实走那条 fallback(api=计费),而非留给你免费派发——订阅席不要挂 api fallback(dry-run 会对此打 ⚠)。
 
 **CH1 子代理席位由你(仲裁人)脚本外派发**,与 `moa.py` 并行:
-1. 先后台启动 `moa.py generate`(CH2/CH3 席位);
+1. 先后台启动 `moa.py generate`(CH2/CH3 席位);弃置落伍席后进程会快速退出、不等后台线程收尾,但**中止路径**(顾问不足 abort)仍走常规退出,最多再等一个 member `timeout_seconds`;
 2. 同时用 Task/Agent 工具派发 CH1 子代理(可指定非会话默认模型,如主模型是 Fable 5 时派 Opus 4.8 子代理),提示词 = 角色契约 + 简报,**明令子代理不得调用工具/读写文件,仅基于简报作答,只输出 JSON**;
 3. 把子代理返回的 JSON 按 `member_<name>.json` 格式写入**同一** `--collect-dir`;
 4. 两边都落盘后,再跑 `moa.py stats`——统计块即覆盖全部席位(含 CH1)。
 
-产物:`moa-reports/run/member_<name>.json`(逐委员结构化意见)、`stats.json`(机械统计,含 `degraded` 标记与每席实际 model/channel)。脚本**可派发席**(CH2/CH3)的成功数 < `min(options.min_successful_members, 可派发席数)`(默认 2)时中止——纯 subagent(CH1)席由你另行派发、不计入此门,合流后含 CH1 的整体法定数由你判定;全 CH1 配置时脚本无席可跑,干净退出不报错。达法定数后落伍席位有 `grace_seconds`(config 示例默认 90s,脚本 fallback 30s;可在 member 上按席覆盖——给重推理旗舰慢席单独放宽,不被全局窗牺牲)宽限窗,超时标 `skipped_grace`(不算失败)。
+产物:`moa-reports/run/member_<name>.json`(逐委员结构化意见)、`stats.json`(机械统计,含 `degraded` 标记与每席实际 model/channel)。脚本**可派发席**(CH2/CH3)的成功数 < `min(options.min_successful_members, 可派发席数)`(默认 2)时中止——纯 subagent(CH1)席由你另行派发、不计入此门,合流后含 CH1 的整体法定数由你判定;全 CH1 配置时脚本无席可跑,干净退出不报错。达法定数后落伍席位有 `grace_seconds`(config 示例默认 90s,脚本 fallback 30s;可在 member 上按席覆盖——给重推理旗舰慢席单独放宽,不被全局窗牺牲)宽限窗,超时标 `skipped_grace`——它不计入上面那道止损门,但在 `stats.json` 里仍算在 `members_failed` 内,另有 `members_skipped` 单列其数,**真故障席数 = `members_failed - members_skipped`**。
+
+`timeout_seconds` 是**每条 fallback 链**的挂钟预算(含该链自己的重试与 JSON 修复轮),不是每次 HTTP 尝试,故单席最坏耗时 = **展开后**的链数 × 该值(未写 `cli_kind` 的 cli 席在 auggie/codex 二进制都在时会展开成两条,按展开后的尝试数算);超预算的链以 `err_class=budget` 让位给下一条。`stats.json` 的 `token_usage` **只汇总成功席**的花销;失败席已计费但没换回意见的那部分目前不汇总(逐席产物里尽力保留,不承诺完整),报成本时须说明这是下界。`roster` 里 `model_known: false` 的席跑的是通道默认模型、家族不可知(收敛时按 `references/synthesis.md` 处理)。
 
 **mode 与场景**:`--mode review`(评审/审查/二次确认/总结评审)、`--mode decide`(多选项决策,委员按 `roles-decide.md` 认领选项对抗论证)、`--mode brainstorm`(头脑风暴,发散人格,无精炼轮)。决策的认领角色由你在 config `custom_roles` 里按选项注入(见 `references/roles-decide.md`)。
 

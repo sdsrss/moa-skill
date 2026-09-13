@@ -7,7 +7,7 @@
 原理基于 **Mixture-of-Agents（MoA）**：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术 / 事实检索）不要用。
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.6.2-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-209%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.7.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-228%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -101,7 +101,7 @@ cp skills/moa/assets/config.example.yaml config.yaml   # 首次；按需改模�
 
 ### 内建可靠性与安全
 
-5xx/429 指数退避重试 · JSON 一次性自修复 · 动态法定人数（`min(2, 席位数)`）+ 30s 宽限窗 · degraded 阵容标记 · 简报与产物密钥泄漏静态扫描（`leak-check`）· 外发前敏感材料告警。
+5xx/429 指数退避重试 · JSON 一次性自修复 · **按 fallback 链的挂钟预算**（`timeout_seconds` 约束整条链，含其重试与修复轮，单条链卡死不会吃掉整席、让配好的降级通道一次都轮不到）· 动态法定人数（`min(2, 席位数)`）+ 宽限窗（出厂配置 90s，可按席覆盖）· degraded 阵容标记 · 简报与产物密钥泄漏静态扫描（`leak-check`）· 外发前敏感材料告警。
 
 ---
 
@@ -219,7 +219,7 @@ key 只从环境变量读取——不落盘、不进日志 / 报告；`leak-chec
 ## 开发
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 169 项(行为测试 + 文档一致性校验)，无网络
+python -m pytest skills/moa/tests/ -q      # 全量用例（行为测试 + 文档一致性校验），无网络
 python skills/moa/scripts/moa.py leak-check # 密钥泄漏静态自查：命中即非零退出（预览脱敏）
 ```
 

@@ -69,7 +69,7 @@ members:
     timeout_seconds: 240       # Gemini 系较慢,单独放宽(auggie 并发实测 97s,勿低于 120)
     # grace_seconds: 150       # (v1.6.0)按席宽限窗覆盖 options.grace_seconds。给这类"高价值但慢"
                                #   的席单独放宽, 让它一定赶上精炼互评轮, 而其余席仍用全局 90s。
-                               #   不设则继承全局值; timeout_seconds 管"单席不被杀", 此项管"宽限窗等不等它", 两者独立。
+                               #   不设则继承全局值; timeout_seconds 管"单条链能跑多久", 此项管"宽限窗等不等它", 两者独立。
     fallback:
       - {channel: api, protocol: openrouter, model: google/gemini-3.1-pro-preview}
 
@@ -92,7 +92,18 @@ members:
 
 options:
   max_tokens_member: 3000      # review/brainstorm 够用;decide + 推理模型长输出建议调到 >=8000
-  timeout_seconds: 180         # 全局默认;member 级 timeout_seconds 覆盖之
+  timeout_seconds: 180         # 全局默认;member 级 timeout_seconds 覆盖之。
+                               # 语义(ISSUE-007 起)= 【每条 fallback 链】的挂钟预算,覆盖该链自己的
+                               # 重试与 JSON 修复轮;不是"每次 HTTP 尝试"。
+                               # 故单席最坏耗时 = 【展开后】的链数 × 本值
+                               # (此前是 链数 × (1+retries) × 本值,默认 A 席实测最坏 36 分钟)。
+                               # "展开后"很重要: 未写 cli_kind 的 cli 席在两个二进制都在时会展开成
+                               # auggie+codex 两条尝试,要按展开后的数目算,不是 config 里写了几条。
+                               # 本文件每个 cli 席都显式写了 cli_kind,故这里两者相等。
+                               # 预算按链分配而非全席共享,保证每条配好的降级通道都至少被试到一次;
+                               # 超预算的链直接让位给下一条(err_class=budget)。快速失败(如 429 秒回)
+                               # 几乎不消耗挂钟,重试次数不变——收紧的是挂钟,不是重试策略。
+                               # 「一次调用即成功」的常见路径完全不受影响。
   min_successful_members: 2    # 运行时取 min(此值, 席位数),避免 L1 单委员被误杀
   grace_seconds: 90            # 达法定席位数后,给落伍者的全局宽限窗(v1.6.0: 30→90)。
                                # 重推理旗舰席(Fable 5 / Gemini Pro 类)天生慢, 30s 窗易把

@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.6.2-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-209%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.7.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-228%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -101,7 +101,7 @@ cp skills/moa/assets/config.example.yaml config.yaml   # then edit models/channe
 
 ### Reliability & safety, built in
 
-Exponential backoff on 5xx/429 · one-shot JSON self-repair · dynamic quorum (`min(2, seats)`) with a 30 s grace window · degraded-roster flagging · secret-leak scanner over briefings and artifacts (`leak-check`) · sensitive-material egress warning before any external call.
+Exponential backoff on 5xx/429 · one-shot JSON self-repair · **a per-fallback-link wall-clock budget** (`timeout_seconds` bounds a whole link — its retries and repair round included — so one stuck link can't consume the seat and leave the configured fallbacks untried) · dynamic quorum (`min(2, seats)`) with a grace window (90 s in the shipped config, per-seat overridable) · degraded-roster flagging · secret-leak scanner over briefings and artifacts (`leak-check`) · sensitive-material egress warning before any external call.
 
 ---
 
@@ -219,7 +219,7 @@ Per the MoA paper, aggregators benefit from full context while proposers don't �
 ## Development
 
 ```bash
-python -m pytest skills/moa/tests/ -q      # 169 cases (behavior + doc-consistency fixtures), no network
+python -m pytest skills/moa/tests/ -q      # full suite (behavior + doc-consistency fixtures), no network
 python skills/moa/scripts/moa.py leak-check # static secret-leak self-check: non-zero exit on hit (preview redacted)
 ```
 
