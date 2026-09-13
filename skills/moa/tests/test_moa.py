@@ -1659,3 +1659,112 @@ def test_member_write_load_roundtrip(tmp_path):
     assert [m["name"] for m in gen] == ["a"]  # round_no=0 排除 .r1
     r1 = moa.load_members(tmp_path, round_no=1)
     assert [m["name"] for m in r1] == ["b"]
+
+
+# ---------- ISSUE-005 的漏网门: --models 在 validate_config 之前就碰未校验的 cfg ----------
+
+def test_main_names_the_error_when_config_is_not_a_mapping(tmp_path, monkeypatch):
+    """main() 的次序是 resolve_config → apply_custom_committee → validate_config。
+    validate_config 早就为「顶层不是映射」写好了具名报错, 但 --models 让 apply_custom_committee
+    先对未校验的 cfg 做 dict(cfg):空 YAML → None → 裸 TypeError traceback, 绕过了那道门。
+    (不给 --models 时同一份 config 报的是具名错误 —— 见下一条, 两条路径此前不对称。)"""
+    cfg = tmp_path / "empty.yaml"
+    cfg.write_text("", encoding="utf-8")
+    brief = tmp_path / "b.md"
+    brief.write_text("材料", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv",
+                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief),
+                         "--models", "openai/gpt-4o"])
+    with pytest.raises(SystemExit) as ei:
+        moa.main()
+    # 断言【具体那一句】: 只查 "[config]" 的话, 守卫改成 `return {}`(报错变成"缺 members 列表")
+    # 照样绿 —— 而本条修复的立意恰恰是"两条路径给同一句"(预审 L3)。
+    assert "顶层必须是 YAML 映射" in str(ei.value)
+
+
+def test_main_names_the_same_error_without_models(tmp_path, monkeypatch):
+    """对照组: 同一份空 config 不给 --models 时走的是 validate_config 的具名门。
+    两条路径必须给同一类报错, 否则「具名报错而非 traceback」只对一半用户成立。"""
+    cfg = tmp_path / "empty.yaml"
+    cfg.write_text("", encoding="utf-8")
+    brief = tmp_path / "b.md"
+    brief.write_text("材料", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv",
+                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief)])
+    with pytest.raises(SystemExit) as ei:
+        moa.main()
+    assert "顶层必须是 YAML 映射" in str(ei.value)
+
+
+def test_models_still_overrides_members_on_a_valid_config():
+    """防误拒: 新门只拦非映射, 合法 config + --models 仍然整体替换 members, options 原样保留。"""
+    cfg = {"members": [{"name": "old", "channel": "api", "model": "m"}],
+           "options": {"max_tokens_member": 100}}
+    out = moa.apply_custom_committee(cfg, types.SimpleNamespace(models="a/m1,b/m2", members=None))
+    assert [m["model"] for m in out["members"]] == ["a/m1", "b/m2"]
+    assert out["options"] == {"max_tokens_member": 100}
+
+
+# ---------- 已发布制品的可发现性信号: 未设的 options 键代入了默认值 ----------
+
+def _partial_opts_config(tmp_path, options_body):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("members:\n  - name: a\n    seat: A\n    channel: api\n    model: m\n"
+                   + options_body, encoding="utf-8")
+    brief = tmp_path / "b.md"
+    brief.write_text("材料", encoding="utf-8")
+    return cfg, brief
+
+
+def test_main_announces_option_defaults_once(tmp_path, monkeypatch, capsys):
+    """B1(预审):本版把「半块 options = 拒绝启动、零支出」改成「按用户没写过的值开跑并计费」,
+    属已发布制品的用户可见默认行为变更,runbook 要求一次性可发现信号(先例 _warn_budget_semantics_once)。
+    信号打在 main() 里、每次运行一行,而不是打在 _opt() 里——后者每席每链都会被调、还跑在 worker
+    线程里,会交错刷屏。"""
+    cfg, brief = _partial_opts_config(tmp_path, "options:\n  min_successful_members: 1\n")
+    monkeypatch.setattr(sys, "argv",
+                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief)])
+    moa.main()
+    err = capsys.readouterr().err
+    assert err.count("[options]") == 1                    # 一行, 不是每键一行/每席一行
+    for key in ("timeout_seconds", "max_tokens_member", "grace_seconds"):
+        assert key in err                                 # 点名哪几个键没设
+    assert "3000" in err and "180" in err                 # 代入了什么值
+    line = [ln for ln in err.splitlines() if "[options]" in ln][0]
+    assert "min_successful_members" not in line           # 用户【写过】的键不得被列成"未设"
+    assert "assets/config.example.yaml" in err            # 怎么固定住
+    assert "v1.9.0" in err                                # 本来会崩 —— 用户真正需要的那半句
+    assert "pin v1.9.0" in err                            # 回退路径
+
+
+def test_main_stays_silent_when_options_are_complete(tmp_path, monkeypatch, capsys):
+    """防误拒/防刷屏: 出厂示例 config 四个键齐全 ⇒ 默认用户永远看不到这行。
+    信号的受众必须精确等于行为变更的受众(过去会崩的那批 config)。"""
+    shipped = yaml.safe_load(
+        (Path(moa.__file__).resolve().parent.parent / "assets" / "config.example.yaml")
+        .read_text(encoding="utf-8"))
+    body = "options:\n" + "".join(
+        f"  {k}: {v}\n" for k, v in shipped["options"].items())
+    cfg, brief = _partial_opts_config(tmp_path, body)
+    monkeypatch.setattr(sys, "argv",
+                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief)])
+    moa.main()
+    assert "[options]" not in capsys.readouterr().err
+
+
+def test_default_options_track_the_shipped_example():
+    """M1(预审):CHANGELOG 与代码注释都把「DEFAULT_OPTIONS 取自出厂示例(grace 除外)」当不变量
+    在讲,却没有任何机械门——把 max_tokens_member 默认值改成 8000 全量仍绿,因为两条 dispatch
+    用例写的是 `assert seen[...] == moa.DEFAULT_OPTIONS[...]`(自指断言,按定义抓不住值的改变)。
+    本门同时守反向漂移:示例被改而默认没跟。"""
+    shipped = yaml.safe_load(
+        (Path(moa.__file__).resolve().parent.parent / "assets" / "config.example.yaml")
+        .read_text(encoding="utf-8"))["options"]
+    assert set(moa.DEFAULT_OPTIONS) == set(shipped)          # 键集同集, 防一侧新增键
+    for key, value in (("timeout_seconds", 180), ("max_tokens_member", 3000),
+                       ("min_successful_members", 2)):
+        assert moa.DEFAULT_OPTIONS[key] == shipped[key] == value
+    # grace_seconds 是唯一的显式例外: 示例的 90 是给重推理旗舰席的建议值, 脚本 fallback 保持 30
+    # 向后兼容(v1.6.0 起的既有约定)。两个数都钉住, 任何一侧被"对齐"都会红。
+    assert shipped["grace_seconds"] == 90
+    assert moa.DEFAULT_OPTIONS["grace_seconds"] == 30

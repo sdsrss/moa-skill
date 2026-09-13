@@ -3,6 +3,87 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.10.0] — 2026-09-13
+
+### Upgrading — only if your `options:` block is not complete
+
+If every one of `timeout_seconds` / `max_tokens_member` / `min_successful_members` /
+`grace_seconds` is set in your config (the shipped `assets/config.example.yaml` sets all four),
+**nothing changes for you** and you can stop reading: `dry-run` output is byte-identical to 1.9.0.
+
+If any of them is missing, or is written with an empty value, this release changes what happens.
+Before, such a config was accepted by validation and then died at dispatch with a raw traceback.
+Now the missing keys take documented defaults and **the run proceeds and bills** — `max_tokens_member`
+is a per-call spend ceiling and `timeout_seconds` is a per-fallback-link wall clock, so a config that
+previously could not start now can spend money.
+
+- **What you must do**: nothing, if the defaults suit you. To keep full control, write the four keys
+  explicitly into your `options:` block, copying `assets/config.example.yaml`.
+- **How you will notice**: the script prints one `[options]` line to stderr naming every key it
+  defaulted and the value it used. It appears once per run, and never for a complete config.
+- **How to revert**: pin 1.9.0. There is no flag to restore the old behaviour, because the old
+  behaviour was a crash.
+
+### Fixed
+- **A half-written `options:` block passed validation and then crashed at dispatch.** Both numeric
+  validators in `validate_config` state in their own comments that an unset key is legal because it
+  "uses the default" — and four accept-tests pin that contract (27 test sites pass `options: {}` as
+  filler). No default layer ever existed. The same contract therefore broke differently on each
+  half of the key set, and the two halves differ in how much they cost you:
+
+  - `timeout_seconds` and `max_tokens_member` were read with a bare subscript. A **missing** key
+    raised `KeyError: 'timeout_seconds'` at the first dispatch — loud, immediate, before any
+    request went out. A key **written blank** was worse in a quieter way: the subscript found it and
+    returned `None`, which travelled into the socket timeout and into the `max_tokens` payload and
+    the truncation-retry arithmetic.
+  - `grace_seconds` and `min_successful_members` were read with `.get(key, literal)`, which falls
+    back only when the key is **absent**; a key written blank is an explicit `None` and went
+    straight through. `min_successful_members:` then died in `cmd_generate`'s `min(None, …)` before
+    dispatch, costing nothing. `grace_seconds:` is the expensive one: the deadline it feeds is only
+    computed once quorum is reached *and* stragglers are still pending, so the same config can work
+    one day and, on a slower day, die at `time.monotonic() + None` after several seats have already
+    answered and been billed, with part of the artifact set already on disk.
+
+  There is now one source: `DEFAULT_OPTIONS` plus an `_opt()` reader used at all six call sites.
+  Missing keys and blank keys are treated alike. The test is `is None` rather than `or` — not a
+  behaviour repair (the old `.get(key, literal)` also passed an explicit `0` through) but a guard
+  against writing the obvious thing later: `grace_seconds: 0` (wait for nobody) and
+  `min_successful_members: 0` (no floor) are both values the validator explicitly admits, and `or`
+  would silently promote them to 30 and 2.
+
+  The defaults are the shipped example's values — with one deliberate exception. `grace_seconds`
+  stays at **30**, not the example's 90; that split is the documented v1.6.0 back-compat contract,
+  recorded in `SKILL.md` and in `config.example.yaml`'s own comment. A test now reads the shipped
+  example and asserts the three tracking keys match it exactly and that `grace_seconds` is the
+  documented 30-vs-90 exception, so neither side can drift into the other.
+
+  This closes both of the `Known, not fixed here` items recorded under 1.8.0 below.
+
+- **`--models` bypassed the named config error and raised a raw `TypeError`.** `main()` runs
+  `resolve_config` → `apply_custom_committee` → `validate_config`, so `--models` reaches
+  `dict(cfg)` before anything has checked the config's shape. An empty YAML file parses to `None`,
+  giving `TypeError: 'NoneType' object is not iterable` — while the *same* config without
+  `--models` produced `validate_config`'s named `[config]` message. One door, two treatments; the
+  same asymmetry ISSUE-005 was opened for. `apply_custom_committee` now returns a non-mapping
+  config untouched so the existing named error is the one users see on both paths. No second
+  message was added, and the tests assert both paths produce that same sentence.
+
+### Added
+- **One `[options]` line on stderr when a key was defaulted.** It names each unset key, the value
+  substituted, what that value governs (spend ceiling / wall clock / abort floor / grace window),
+  how to pin it, and that 1.9.0 and earlier would have crashed here instead of calling out. It is
+  emitted once per run from `main()`, after validation and before any dispatch, so it covers
+  `generate` / `refine` / `discuss-*` / `dry-run` in one place and cannot interleave with worker
+  threads. A complete config never triggers it.
+
+Tests 355 → 372. Coverage was measured by mutation rather than asserted: 19 reverts of the changed
+lines, 18 caught by the suite. The single survivor is the `(opts or {})` guard inside `_opt`, which
+`validate_config` makes unreachable — defensive, not a tested path. An independent empty-context
+pre-ship review (`tasks/preship-review-unreleased.md`) is what found the first version of this net:
+it missed the two `cmd_refine` call sites entirely, so both could be reverted line-for-line with the
+suite still green. Those two tests are now here, as is a gate tying `DEFAULT_OPTIONS` to the shipped
+example.
+
 ## [1.9.0] — 2026-09-13
 
 Closes ISSUE-012 — the per-seat usage ledger that `tasks/specs/degradation-budget.md` has been

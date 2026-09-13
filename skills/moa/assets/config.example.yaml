@@ -91,6 +91,14 @@ members:
 # 仲裁人 = 当前 agent(带完整上下文),不在此配置,不走外部调用。
 
 options:
+  # 本块的四个键【逐个】都可省略,也可以写了键留空(YAML 的显式 null);两种写法都按脚本的
+  # DEFAULT_OPTIONS 回落:timeout_seconds=180 / max_tokens_member=3000 /
+  # min_successful_members=2 / grace_seconds=30(注意 grace 的脚本 fallback 与本文件下面写的
+  # 90 【故意】不同,见该键的注释)。0 在 grace_seconds 与 min_successful_members 上是合法值,
+  # 不会被当成"未设"。
+  # 但整块 options 不能空着:四个键全不写就要写成 `options: {}`,只留一个裸 `options:`
+  # 的话它的 YAML 值是 null,会被 validate_config 当成"缺 options 块"当场拒绝。
+  # 用了默认值时脚本会在 stderr 打一行 [options] 说明代入了什么——四个键写齐就不会出现。
   max_tokens_member: 3000      # review/brainstorm 够用;decide + 推理模型长输出建议调到 >=8000
   timeout_seconds: 180         # 全局默认;member 级 timeout_seconds 覆盖之。
                                # 语义(ISSUE-007 起)= 【每条 fallback 链】的挂钟预算,覆盖该链自己的

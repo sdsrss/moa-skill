@@ -905,3 +905,159 @@ def test_is_subscription_seat_leaves_auggie_billed(channel_used, is_sub):
     """把判据从 `cli:codex` 放宽成 `cli:` 会【静默】把每个 auggie 席的白花归零,
     而出厂默认阵容有三个 auggie 席(A/C/D)。此前无测试(预审 round-3 Q5)。"""
     assert moa._is_subscription_seat({"channel_used": channel_used}) is is_sub
+
+
+# ---------- options 默认层: 校验器承诺的「未设 = 用默认」在消费侧从未实现 ----------
+#
+# validate_config 的两个校验器都写着「未设(None)= 用默认, 合法」(_bad_grace / _bad_pos),
+# test_moa.py 的四个 accept 用例把这条钉成契约(全仓 27 处测试拿 `options: {}` 当填充物)。
+# 消费侧却没有默认源, 四个键分两种崩法:
+#   timeout_seconds / max_tokens_member  → 裸下标 opts["k"], 键缺失即 KeyError
+#   grace_seconds / min_successful_members → .get(k, 字面量), 只在【键缺失】时回落;
+#                                            YAML 写了键留空(`grace_seconds:`)是显式 None, 漏下去
+# 两种形态下用户看到的都是裸 traceback, 且都发生在校验之后、派发之时。
+
+def test_dispatch_uses_option_defaults_when_keys_are_absent(monkeypatch):
+    """`options: {}`: 修前 KeyError: 'timeout_seconds'(SKILL.md 曾把它记作「已知未修」并教绕行)。"""
+    seen = {}
+
+    def fake_repair(ccfg, system, user, temp, max_tokens, timeout, schema=None, **_):
+        seen["max_tokens"], seen["timeout"] = max_tokens, timeout
+        return "{}", {"verdict": "pass"}, {"total_tokens": 3}
+
+    monkeypatch.setattr(moa, "call_with_json_repair", fake_repair)
+    res = moa._dispatch_channels({"name": "a", "seat": "A", "channel": "api", "model": "m"},
+                                 "r", "s", "u", {})
+    assert res["parsed"] == {"verdict": "pass"}
+    assert seen["timeout"] == moa.DEFAULT_OPTIONS["timeout_seconds"]
+    assert seen["max_tokens"] == moa.DEFAULT_OPTIONS["max_tokens_member"]
+
+
+def test_dispatch_uses_option_defaults_when_keys_are_written_blank(monkeypatch):
+    """YAML `timeout_seconds:` 留空 = 显式 None: 键在、值是 None, 裸下标拿得到却算不了 ——
+    修前 `time.monotonic() + None` TypeError。与上一条同源, 是 .get 回落治不了的那一半。"""
+    seen = {}
+
+    def fake_repair(ccfg, system, user, temp, max_tokens, timeout, schema=None, **_):
+        seen["max_tokens"], seen["timeout"] = max_tokens, timeout
+        return "{}", {"verdict": "pass"}, {"total_tokens": 3}
+
+    monkeypatch.setattr(moa, "call_with_json_repair", fake_repair)
+    res = moa._dispatch_channels({"name": "a", "seat": "A", "channel": "api", "model": "m"},
+                                 "r", "s", "u", {"timeout_seconds": None,
+                                                 "max_tokens_member": None})
+    assert res["parsed"] == {"verdict": "pass"}
+    assert seen["timeout"] == moa.DEFAULT_OPTIONS["timeout_seconds"]
+    assert seen["max_tokens"] == moa.DEFAULT_OPTIONS["max_tokens_member"]
+
+
+def test_generate_uses_option_defaults_for_quorum_and_grace(monkeypatch, tmp_path):
+    """cmd_generate 的另两个键走 .get(k, 字面量), 在显式 None 上同样回落不了:
+    min_successful_members → `min(None, …)` TypeError(在 dispatch 之前就崩);
+    grace_seconds → dispatch_with_quorum 的 `now + None` TypeError。"""
+    seen = {}
+
+    def fake_quorum(members, fn, quorum_target, grace_s, on_done=None):
+        seen["quorum_target"], seen["grace_s"] = quorum_target, grace_s
+        return [{"name": m["name"], "seat": m.get("seat"), "role": "r",
+                 "parsed": {"verdict": "pass", "confidence": 0.5, "issues": []},
+                 "usage": None, "usage_total": moa._UsageLedger().as_dict(),
+                 "model_used": "m", "channel_used": "api",
+                 "latency_s": 0.0, "error": None, "err_class": None} for m in members]
+
+    monkeypatch.setattr(moa, "dispatch_with_quorum", fake_quorum)
+    brief = tmp_path / "b.md"
+    brief.write_text("材料", encoding="utf-8")
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "m"},
+                       {"name": "b", "seat": "B", "channel": "api", "model": "m"}],
+           "options": {"min_successful_members": None, "grace_seconds": None}}
+    args = types.SimpleNamespace(input=str(brief), member=None, mode="review",
+                                 collect_dir=str(tmp_path), topic=None)
+    moa.cmd_generate(args, cfg)
+    assert seen["quorum_target"] == moa.DEFAULT_OPTIONS["min_successful_members"]  # min(2, 2)
+    assert seen["grace_s"] == moa.DEFAULT_OPTIONS["grace_seconds"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("grace_seconds", 0),              # 0 = 不给宽限, 合法(test_validate_config_accepts_valid_grace)
+    ("min_successful_members", 0),     # 0 = 不设成功下限, 合法(ISSUE-003 的 accept 用例明写)
+])
+def test_option_zero_is_kept_not_replaced_by_the_default(key, value):
+    """防误拒: 默认层若写成 `v or DEFAULT[k]`, 合法的 0 会被静默顶成 30 / 2 ——
+    grace=0 变 30 是把「不等落伍席」改成等 30 秒, min=0 变 2 是凭空造一道中止门。"""
+    assert moa._opt({key: value}, key) == value
+
+
+def test_documented_script_fallbacks_are_not_silently_changed():
+    """收口到单一默认源时不得顺手对齐示例值: config.example.yaml 全局写 90, 但脚本 fallback
+    是 30 —— SKILL.md 的 v1.6.0 变更段、SKILL.md 的产物/预算段、config.example.yaml 的 grace 键
+    注释,三处都写着「脚本 fallback 默认仍 30(未配时向后兼容)」;min_successful_members 的 2
+    同样由 SKILL.md 的产物段记载。(不写行号:本轮插入 v1.10.0 变更块后行号已漂过一次,预审 L2。)"""
+    assert moa.DEFAULT_OPTIONS["grace_seconds"] == 30
+    assert moa.DEFAULT_OPTIONS["min_successful_members"] == 2
+
+
+@pytest.mark.parametrize("seat_val,global_opts,expect", [
+    (30,   {"timeout_seconds": 180}, 30),    # 按席显式值胜出
+    (None, {"timeout_seconds": 30},  30),    # 按席写了键留空 → 继承【全局】, 不是 DEFAULT
+    (None, {},                       180),   # 两级都未设 → DEFAULT_OPTIONS
+    (0,    {"timeout_seconds": 180}, 0),     # 按席 0 照传: 判据是 `is None`, 不是 `or`
+])
+def test_seat_timeout_precedence_chain(monkeypatch, seat_val, global_opts, expect):
+    """按席 timeout 的三级回落: member → options → DEFAULT_OPTIONS。
+    末一例是 `or` 与 `is None` 唯一分叉处——config 层拒按席 0(_bad_pos),但 _dispatch_channels
+    有四个内部调用方且测试直接驱动它,派发层照传拿到的值、由 config 层决定什么合法。"""
+    seen = {}
+
+    def fake_repair(ccfg, system, user, temp, max_tokens, timeout, schema=None, **_):
+        seen["timeout"] = timeout
+        return "{}", {"verdict": "pass"}, {"total_tokens": 3}
+
+    monkeypatch.setattr(moa, "call_with_json_repair", fake_repair)
+    # seat_val=None 这两例写的是【键在、值为 None】(YAML `timeout_seconds:` 留空),
+    # 与「不写该键」同义——_opt 的判据对两者一视同仁,这里取更易出错的那种写法。
+    member = {"name": "a", "seat": "A", "channel": "api", "model": "m",
+              "timeout_seconds": seat_val}
+    moa._dispatch_channels(member, "r", "s", "u", global_opts)
+    assert seen["timeout"] == expect
+
+
+def test_refine_uses_option_defaults_for_quorum_and_grace(monkeypatch, tmp_path):
+    """H1(预审):六个收口点里 cmd_refine 的两个此前【没有任何回归护栏】——整行退回改动前的
+    `.get(k, 字面量)` 仍 368/368 全绿。而 refine 恰是最可能带着半块 options 进来的阶段:
+    `resolve_config` 对它禁用示例回退,它必须跑在与 generate 同一份 config 上。"""
+    seen = {}
+
+    def fake_quorum(members, fn, quorum_target, grace_s, on_done=None):
+        seen["quorum_target"], seen["grace_s"] = quorum_target, grace_s
+        out = []
+        for m in members:
+            r = {"name": m["name"], "seat": m.get("seat"), "role": "r",
+                 "parsed": {"verdict": "pass", "confidence": 0.5, "issues": []},
+                 "usage": None, "usage_total": moa._UsageLedger().as_dict(),
+                 "model_used": "m", "channel_used": "api",
+                 "latency_s": 0.0, "error": None, "err_class": None}
+            out.append(r)
+            if on_done:
+                on_done(r)
+        return out
+
+    monkeypatch.setattr(moa, "dispatch_with_quorum", fake_quorum)
+    brief = tmp_path / "b.md"
+    brief.write_text("材料", encoding="utf-8")
+    members = [{"name": "a", "seat": "A", "channel": "api", "model": "m"},
+               {"name": "b", "seat": "B", "channel": "api", "model": "m"}]
+    for m in members:                                  # 上一轮产物, 否则 refine 直接 abort
+        moa.write_member(tmp_path, {"name": m["name"], "seat": m["seat"], "role": "r",
+                                    "model_used": "m", "channel_used": "api",
+                                    "parsed": {"verdict": "pass", "confidence": 0.5, "issues": []},
+                                    "usage": None, "latency_s": 0.0,
+                                    "error": None, "err_class": None}, round_no=0)
+    cfg = {"members": members,
+           "options": {"min_successful_members": None, "grace_seconds": None}}
+    args = types.SimpleNamespace(input=str(brief), member=None, mode="review",
+                                 collect_dir=str(tmp_path), round=1)
+    moa.cmd_refine(args, cfg)
+    # 2 席: min_ok = min(2, 2) = 2, quorum_target = max(2, 1) = 2 —— 默认值改成 1 会掉到 1
+    assert seen["quorum_target"] == moa.DEFAULT_OPTIONS["min_successful_members"] == 2
+    assert seen["grace_s"] == moa.DEFAULT_OPTIONS["grace_seconds"]

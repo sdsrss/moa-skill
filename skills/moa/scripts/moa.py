@@ -673,6 +673,65 @@ def _seat_role(member, mode):
     return member.get("role") or DEFAULT_SEAT_ROLE.get((mode, seat)) or seat
 
 
+# options 的单一默认源。validate_config 的 _bad_grace / _bad_pos 都明写「未设(None)= 用默认,
+# 合法」,四个 accept 用例(test_validate_config_accepts_valid / _valid_grace / _valid_numeric_options
+# / _empty_seat_when_role_is_explicit)也把「options 键可选」钉成契约——但消费侧此前没有默认源,
+# 于是同一个契约在四个键上有两种崩法:timeout_seconds / max_tokens_member 是裸下标(键缺失即
+# KeyError),grace_seconds / min_successful_members 是 `.get(k, 字面量)`(只在【键缺失】时回落,
+# 而 YAML 里写了键留空的 `grace_seconds:` 是显式 None,照样漏进 `now + None`)。
+# 这两个数不是新发明的:与 assets/config.example.yaml 的出厂值一致。
+#
+# grace_seconds 的 30 与示例里的 90 【故意】不同,不要顺手对齐:SKILL.md §v1.6.0 / §产物段与
+# config.example.yaml 的注释三处都写着「脚本 fallback 默认仍 30(未配时向后兼容)」,示例的 90
+# 是给重推理旗舰席的建议值。test_documented_script_fallbacks_are_not_silently_changed 钉住这条。
+DEFAULT_OPTIONS = {
+    "timeout_seconds": 180,        # = config.example.yaml;语义是【每条 fallback 链】的挂钟预算
+    "max_tokens_member": 3000,     # = config.example.yaml(decide + 推理模型长输出建议调大)
+    "min_successful_members": 2,   # 运行时再取 min(此值, 可派发席数),见 cmd_generate 的 min_ok
+    "grace_seconds": 30,           # 脚本 fallback,【不是】示例里的 90。见上。
+}
+
+
+def _opt(opts, key):
+    """读一个 options 值,未设则给 DEFAULT_OPTIONS。键缺失与显式 None 一视同仁——校验器承诺的
+    「未设 = 用默认」在 YAML 里有两种写法(不写该键 / 写了键留空),两种都必须回落。
+    判据只能是 `is None`:0 在 grace_seconds(不给宽限)与 min_successful_members(不设下限)
+    上都是校验器明确放行的合法值,写成 `or` 会把它们静默顶成 30 / 2。"""
+    v = (opts or {}).get(key)
+    return DEFAULT_OPTIONS[key] if v is None else v
+
+
+_OPTION_MEANING = {
+    "timeout_seconds": "每条 fallback 链的挂钟预算",
+    "max_tokens_member": "单次调用的计费上限",
+    "min_successful_members": "止损门:成功席下限",
+    "grace_seconds": "落伍席宽限窗",
+}
+
+
+def _warn_option_defaults(cfg):
+    """options 里有未设的键、已代入默认值时,到 stderr 说明一次(可发现性信号)。
+
+    本版把「半块 options」从【拒绝启动、零支出】改成【按用户没写过的值开跑并计费】,属已发布
+    制品的用户可见默认行为变更。不读 CHANGELOG 的人得当场看懂:代入了什么值、花的是钱还是挂钟、
+    怎么固定住,以及「本来会崩」这半句——那才是他真正需要知道的差别。
+
+    打在 main() 而不是 `_opt()` 里:`_opt` 每席每链都会被调用,且跑在 worker 线程中,stderr 会
+    交错刷屏;main() 这一处就覆盖 generate / refine / discuss-* / dry-run 全部路径
+    (stats / discuss-stats / leak-check 不读 config,天然不受扰),dry-run 还能和成本估算同屏。
+    不设模块级 flag:main() 本身每进程只跑一次,加 flag 只会在测试之间泄漏状态。
+    出厂示例 config 四键齐全,所以默认用户永远看不到这行——受众精确等于行为变更的受众。
+    """
+    unset = [k for k in DEFAULT_OPTIONS if (cfg.get("options") or {}).get(k) is None]
+    if not unset:
+        return
+    detail = "、".join(f"{k}={DEFAULT_OPTIONS[k]}({_OPTION_MEANING[k]})" for k in unset)
+    print(f"[options] 以下键未设,已代入脚本默认值:{detail}。v1.9.0 及以前这种配置会在派发处"
+          f"崩(KeyError / TypeError)、一次调用都不会发出;现在它会照上面的值真实调用并计费。"
+          f"要固定住就把这些键显式写进 config 的 options 块(参照 assets/config.example.yaml);"
+          f"要完全回到旧行为就 pin v1.9.0。", file=sys.stderr)
+
+
 def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
     """按 fallback 链跑 api/cli 通道,返回结果 dict。generate 与 refine 共用此调度。
     default_temp: 未设 member.temperature_generate 时的默认温度;brainstorm 传更高值发散(P1-4)。"""
@@ -682,7 +741,9 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
         return _fail(member, role_key,
                      "channel=subagent must be dispatched by arbiter (not by moa.py); "
                      "no api/cli fallback configured", "skipped_channel")
-    timeout = member.get("timeout_seconds", opts["timeout_seconds"])
+    # 按席覆盖优先;判据与 _opt 同源(`is None`),不用 `or`——后者会把按席 0 当成未设。
+    seat_timeout = member.get("timeout_seconds")
+    timeout = _opt(opts, "timeout_seconds") if seat_timeout is None else seat_timeout
     t0 = time.time()
     # 逐席账本(ISSUE-012): 建在链循环【之外】, 跨全部 fallback 链与它们各自的重试累计。
     # 它记的是"这一席总共被计了多少费", 与 result["usage"]("换回意见的那条链花了多少")
@@ -723,7 +784,7 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
             else:
                 raw, parsed, usage = call_with_json_repair(
                     ccfg, system, user, member.get("temperature_generate", default_temp),
-                    opts["max_tokens_member"], timeout, None, deadline=link_deadline,
+                    _opt(opts, "max_tokens_member"), timeout, None, deadline=link_deadline,
                     ledger=ledger)
                 if parsed is None:
                     # 与 cli 分支对齐(修 ISSUE-006): 修复轮后仍不可解析 = 这条通道没产出可用意见,
@@ -1077,8 +1138,10 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                         # 整轮 dispatch 随之炸掉, 且 abandoned 仍为 False → shutdown(wait=True)
                         # 还要 join 全部线程, 正是 ISSUE-009 那种挂住(预审 M2)。记成该席失败,
                         # 不连累其余已付费的席。可达性: _dispatch_channels 内部虽 catch 了
-                        # Exception, worker 在它之前还跑 resolve_channel 与 opts["timeout_seconds"],
-                        # 而 `options: {}` 是 validate_config 放行的配置。
+                        # Exception, 但 worker 跑的是 run_member_* —— 它在进入那个 try 之前还要过
+                        # load_role_prompt / _seat_role / anonymize 等可抛路径, 任何一步抛出都落到这里。
+                        # (旧注释举的例子是 opts["timeout_seconds"] 的裸下标, 该下标已随 options
+                        #  默认层移除, 例子不再成立; 分支本身仍可达。)
                         r = _fail(m, m.get("role", "?"),
                                   f"straggler worker raised: {fut.exception()}", "unknown")
                     elif fut.done():
@@ -1997,6 +2060,12 @@ def apply_custom_committee(cfg: dict, args) -> dict:
     models_csv = getattr(args, "models", None)
     if not models_csv:
         return cfg
+    if not isinstance(cfg, dict):
+        # main() 的次序是 resolve_config → 本函数 → validate_config,于是 --models 让 dict(cfg)
+        # 先碰到未校验的 cfg:空 YAML / 顶层是 list 时裸 TypeError,而【不给 --models】的同一份
+        # config 走的是 validate_config 的具名报错——同一道门两种待遇(ISSUE-005 的漏网点)。
+        # 原样交还,让下一行的 validate_config 出具那句已有的具名报错,不在这里另造一句。
+        return cfg
     cfg = dict(cfg)
     cfg["members"] = build_custom_members(models_csv, getattr(args, "members", None))
     return cfg
@@ -2029,9 +2098,9 @@ def cmd_generate(args, cfg):
     # (修 N1: 旧代码分母含纯 subagent 席,但 ok 只统计脚本派发结果——默认 config 恰是 2 subagent +
     # 2 可派发,可派发席掉一个就 ok=1<min_ok=2 被误 abort,废掉 fallback/quorum 想保的降级续跑。
     # 纯 subagent 席由仲裁人脚本外派发,合流后含 CH1 的整体法定数由仲裁人在 collect-dir 上判)。
-    min_ok = min(opts.get("min_successful_members", 2), max(1, len(dispatchable)))
+    min_ok = min(_opt(opts, "min_successful_members"), max(1, len(dispatchable)))
     quorum_target = max(min_ok, len(dispatchable) - 1)  # 达此数后给落伍者宽限
-    grace_s = opts.get("grace_seconds", 30)
+    grace_s = _opt(opts, "grace_seconds")
 
     def _log_write(r):
         write_member(collect, r)
@@ -2133,10 +2202,10 @@ def cmd_refine(args, cfg):
         print(f"  - {r['name']} ({r['role']}, {r['latency_s']}s) via {r.get('channel_used') or '-'}: {status}",
               file=sys.stderr)
 
-    min_ok = min(opts.get("min_successful_members", 2), max(1, len(dispatchable)))  # 同 N1: 分母用 dispatchable
+    min_ok = min(_opt(opts, "min_successful_members"), max(1, len(dispatchable)))  # 同 N1: 分母用 dispatchable
     quorum_target = max(min_ok, len(dispatchable) - 1)
     results = dispatch_with_quorum(
-        dispatchable, one, quorum_target, opts.get("grace_seconds", 30), on_done=_log_write)
+        dispatchable, one, quorum_target, _opt(opts, "grace_seconds"), on_done=_log_write)
     ok = [r for r in results if r["parsed"]]
     # 止损门(修 F2): 有可派发席却全数精炼失败 → 本轮无产出,非零退出,与 cmd_generate 的 abort 对齐。
     # (失败席保留上轮意见是设计——但"全员失败"意味整轮零信息增量,静默 exit 0 会让脚本化串命令
@@ -2406,6 +2475,7 @@ def main():
     cfg = resolve_config(getattr(args, "config", None), allow_example_fallback=not no_fallback)
     cfg = apply_custom_committee(cfg, args)   # --models 给了就覆盖 members(custom 模式)
     validate_config(cfg)                      # 最小 schema 校验,缺字段指名报错(修 P1-1)
+    _warn_option_defaults(cfg)                # 未设的 options 键代入了默认值 → 一次性可发现性信号
     {"generate": cmd_generate, "refine": cmd_refine,
      "discuss-turn": cmd_discuss_turn, "discuss-prompt": cmd_discuss_prompt,
      "discuss-blindvote": cmd_discuss_blindvote,
