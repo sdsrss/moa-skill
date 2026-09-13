@@ -3,6 +3,41 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.7.1] — 2026-09-13
+
+Same-day patch for three regressions v1.7.0's own repairs introduced. A pre-ship reviewer's verdict
+landed after the tag went out; these are the items it scoped as in-release, and all three are
+defects created by v1.7.0 rather than pre-existing ones. **Upgrade from 1.7.0 is recommended for
+anyone whose `config.yaml` has a `cli` seat**, which the first item can stop from starting at all.
+
+### Fixed
+- **A `cli` seat whose fallback omits `channel:` no longer fails validation.** Omitting `channel:`
+  in a fallback entry is legal and means `api` — that is exactly how `resolve_channel` dispatches
+  (`fb.get("channel", "api")`). v1.7.0's new fallback gate judged the merged `{**member, **fb}`
+  view, which inherits the *member's* `channel`, so a `cli` seat carrying a plain
+  `{model: …, protocol: openrouter}` fallback was rejected at startup with an error that called
+  that link `channel=cli`. The gate now pins `channel` to the fallback's own value and judges the
+  remaining keys (`cli_kind` / `model` / `auggie_model`) on the merged view, which is what
+  `_expand_cli` actually reads. Genuinely ambiguous fallbacks — an explicit `channel: cli` with no
+  `cli_kind` and no `auggie_model` — are still rejected.
+- **`--retry-timeout` is integral again.** v1.7.0 started handing the cli repair round the
+  remaining link budget as a float, and the flag is built with `str(max(30, timeout // 3))`, so
+  auggie received `73.0` where it had always received `73`. If its parser is strict that turns the
+  one-shot JSON self-repair into a guaranteed non-zero exit on every auggie seat — three of the four
+  in the shipped committee. Now `int()`-wrapped at the point the argument is built, so it holds
+  whatever the caller passes.
+- **The fast exit now stands down while a CLI call is in flight.** v1.7.0 reasoned that `os._exit`
+  only skipped `TemporaryDirectory`'s cleanup and deleted the registered directories to compensate.
+  It also kills `subprocess.run`'s own timeout watchdog: an abandoned `auggie`/`codex` child is
+  reparented and runs unbounded (this project has measured auggie's internal retry at over seven
+  minutes, billed at upstream +40%), and deleting the directory pulled its workspace out from under
+  it. When any CLI call is still running the process now takes the regular shutdown instead — the
+  pre-1.7.0 behavior, so nothing regresses; it simply forgoes the speed-up in that one case, and the
+  watchdog, the context manager and normal child reaping all work again. The directory deletion
+  described in 1.7.0's ISSUE-009 entry is gone with it.
+
+tests 228 → 231.
+
 ## [1.7.0] — 2026-09-13
 
 Degradation-resilience pass over the three-channel fallback path, driven by three instrumented

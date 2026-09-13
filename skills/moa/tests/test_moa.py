@@ -384,6 +384,29 @@ def test_validate_config_rejects_ambiguous_cli_in_fallback_links():
     assert "fallback" in msg and ("auggie_model" in msg and "cli_kind" in msg)
 
 
+def test_validate_config_allows_fallback_that_omits_channel():
+    """预审评审 A1(阻断级回归): fallback 省略 channel 是合法写法——`resolve_channel` 按
+    `fb.get("channel", "api")` 判,即默认 api。而 {**m, **fb} 会把【member 的】channel 继承进来,
+    于是一个 cli 席挂的 api fallback 被误判成 cli 链并拒绝启动,报错还把它称作 channel=cli。
+    这是启动即失败的误报,且恰好打在 ISSUE-008 想保护的那批用户身上。"""
+    cfg = {"members": [{"name": "a", "channel": "cli",
+                        "fallback": [{"model": "openai/gpt-5.6-sol", "protocol": "openrouter"}]}],
+           "options": {}}
+    moa.validate_config(cfg)                       # 必须放行
+    # 且实跑确实把它展开成 api 链, 证明放行是对的而非放水
+    kinds = [k for k, _, _ in moa.resolve_channel(cfg["members"][0])]
+    assert "api" in kinds
+
+
+def test_validate_config_still_rejects_fallback_with_explicit_cli_channel():
+    """对照: fallback 显式写 channel=cli 且无 cli_kind/auggie_model —— 真歧义, 仍须拒。"""
+    with pytest.raises(SystemExit):
+        moa.validate_config({"members": [
+            {"name": "a", "channel": "api", "model": "m",
+             "fallback": [{"channel": "cli", "model": "gpt5.6-sol"}]}],
+            "options": {}})
+
+
 def test_validate_config_fallback_inherits_member_auggie_model():
     """member 上的 auggie_model 会被 merge 进 fallback({**member, **fb}),故不构成歧义——
     门必须按 merge 后的视图判,不能只看 fb 自己写了什么。"""
@@ -944,21 +967,40 @@ def test_fast_exit_never_fires_outside_the_cli_entrypoint(monkeypatch):
     assert killed == [0]
 
 
-def test_fast_exit_purges_abandoned_cli_tmpdirs(monkeypatch, tmp_path):
-    """预审评审 #3 回归: os._exit 跳过 TemporaryDirectory 的清理 finalizer,而 CLI 席把整份
-    prompt(= 完整简报)写在该目录的 prompt.txt 里。被弃的落伍席因此会把简报留在系统临时目录——
-    v1.7.0 之前 atexit join 让线程跑完、上下文管理器自己清掉了。快速退出前必须显式清。"""
+def test_fast_exit_defers_while_a_cli_call_is_in_flight(monkeypatch, tmp_path):
+    """预审评审 #3 + fix-3 尾: os._exit 杀掉的不只是 TemporaryDirectory 的清理 finalizer,
+    还有 subprocess.run 的超时看门狗。被弃的 auggie/codex 子进程会被 reparent 后无界地跑下去
+    (README 记录过 auggie 内部重试 >7 分钟,按上游价 +40% 计费),同时它的 prompt.txt(整份简报)
+    留在系统临时目录。所以只在【没有 CLI 调用在飞】时快速退出;有就退回常规退出——那正是
+    v1.7.0 之前的行为,不构成回归,只是放弃这一种情况下的提速。"""
     killed = []
     monkeypatch.setattr(moa.os, "_exit", lambda code: killed.append(code))
-    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", True)
     monkeypatch.setattr(moa, "_RUNNING_AS_CLI", True)
-    leaked = tmp_path / "moa_auggie_abandoned"
-    leaked.mkdir()
-    (leaked / "prompt.txt").write_text("简报正文:含待评材料", encoding="utf-8")
-    monkeypatch.setattr(moa, "_ACTIVE_CLI_TMPDIRS", {str(leaked)})
+    monkeypatch.setattr(moa, "_ABANDONED_STRAGGLERS", True)
+    monkeypatch.setattr(moa, "_ACTIVE_CLI_TMPDIRS", {str(tmp_path)})
     moa._fast_exit_if_stragglers()
-    assert killed == [0]
-    assert not leaked.exists()                # 简报不留在磁盘上
+    assert killed == []                       # 有 CLI 在飞: 不强杀, 让看门狗与清理器跑完
+    monkeypatch.setattr(moa, "_ACTIVE_CLI_TMPDIRS", set())
+    moa._fast_exit_if_stragglers()
+    assert killed == [0]                      # 无 CLI 在飞: 快速退出照旧
+
+
+def test_auggie_retry_timeout_arg_is_integral(monkeypatch):
+    """预审评审 #8: ISSUE-007 之后 cli 修复轮拿到的是 _remaining() 的【浮点】剩余预算,
+    而 --retry-timeout 由 str(max(30, timeout // 3)) 拼出 → '73.0'。auggie 的参数解析若严格
+    要整数,修复轮就在出厂委员会的 A/C/D 三席上静默失效(非零退出记 err_class=cli)。"""
+    seen = {}
+
+    class _P:
+        returncode = 0
+        stdout = b'{"result": "{\\"v\\": 1}"}'
+        stderr = b""
+
+    monkeypatch.setattr(moa, "_which", lambda e: "/usr/bin/auggie")
+    monkeypatch.setattr(moa.subprocess, "run", lambda cmd, **kw: (seen.setdefault("cmd", cmd), _P())[1])
+    moa.call_cli_auggie({"model": "m"}, "s", "u", 219.7)      # 浮点预算,如 _remaining 所返
+    arg = seen["cmd"][seen["cmd"].index("--retry-timeout") + 1]
+    assert "." not in arg, f"--retry-timeout 收到非整数: {arg!r}"
 
 
 def test_fast_exit_is_noop_without_abandoned_stragglers(monkeypatch):

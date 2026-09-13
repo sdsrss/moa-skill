@@ -24,7 +24,6 @@ import contextlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -380,15 +379,15 @@ def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=N
 
 # ---------- CH2: codex CLI 通道 ----------
 
-# 在跑的 CLI 临时目录。快速退出(_fast_exit_if_stragglers)会绕过 TemporaryDirectory 的清理
-# finalizer,故需登记在册显式清掉——目录里有 auggie 席写的完整简报(预审评审 #3)。
+# 在飞的 CLI 调用登记表(键是其临时目录)。非空 = 有子进程在跑,此时禁止快速退出:
+# os._exit 会一并杀掉 subprocess.run 的超时看门狗,把子进程变成无人收割的孤儿(预审评审 #3)。
 _ACTIVE_CLI_TMPDIRS = set()
 
 
 @contextlib.contextmanager
 def _cli_tmpdir(prefix):
-    """CLI 通道的临时目录 + 在册登记。正常路径仍由 TemporaryDirectory 自己清理,
-    本包装只负责登记/注销,让 os._exit 前有办法把被弃席的目录一并清掉。
+    """CLI 通道的临时目录 + 在飞登记。目录始终由 TemporaryDirectory 自己清理,本包装只负责
+    登记/注销,让 _fast_exit_if_stragglers 能看出"还有 CLI 子进程在跑"从而避让。
     set.add/discard 在 GIL 下是原子操作,worker 线程并发登记无需额外加锁。"""
     with tempfile.TemporaryDirectory(prefix=prefix) as td:
         _ACTIVE_CLI_TMPDIRS.add(td)
@@ -469,7 +468,10 @@ def call_cli_auggie(cfg, system, user, timeout):
         pf.write_text(prompt, encoding="utf-8")
         cmd = [auggie_bin, "--print", "--quiet", "--output-format", "json",
                "--max-turns", "1", "--dont-save-session",
-               "--retry-timeout", str(max(30, timeout // 3)),
+               # int(): 修复轮传进来的是 _remaining() 的浮点剩余预算(ISSUE-007 起),
+               # 直接 str() 会拼出 "73.0";auggie 参数解析若严格要整数,修复轮就在出厂
+               # A/C/D 三席上静默失效(预审评审 #8)。
+               "--retry-timeout", str(int(max(30, timeout // 3))),
                "--workspace-root", str(ws), "--instruction-file", str(pf)]
         if cfg.get("model"):
             cmd += ["--model", cfg["model"]]
@@ -882,12 +884,14 @@ def _fast_exit_if_stragglers():
     只由 main() 调用: 放进 cmd_* 会让直接调用这些函数的测试把 pytest 进程一起杀掉。"""
     if not (_RUNNING_AS_CLI and _ABANDONED_STRAGGLERS):
         return
-    # 被弃线程正停在 CLI 通道的 `with tempfile.TemporaryDirectory(...)` 里, os._exit 会跳过它的
-    # 清理 finalizer —— 而 call_cli_auggie 把整份 prompt(= 完整简报)写在该目录的 prompt.txt。
-    # 不显式清就等于把待评材料留在系统临时目录(预审评审 #3;v1.7.0 之前 atexit join 让线程
-    # 自己跑完、上下文管理器清掉了)。落伍席的结果本就丢弃, 强删不影响任何产物。
-    for d in list(_ACTIVE_CLI_TMPDIRS):
-        shutil.rmtree(d, ignore_errors=True)
+    # 有 CLI 调用在飞就【不】快速退出(预审评审 #3 及其后续)。os._exit 杀掉的不只是
+    # TemporaryDirectory 的清理 finalizer —— 还有 subprocess.run 自己的超时看门狗:
+    # 被弃席的 auggie/codex 子进程会被 reparent 后无界地跑下去(README 记录过 auggie 内部重试
+    # >7 分钟, 按上游价 +40% 计费), 而它的 prompt.txt(整份简报)留在系统临时目录。
+    # 这种情况退回常规退出 —— 正是 v1.7.0 之前的行为, 不构成回归, 只是放弃这一种情况下的提速:
+    # 等 atexit join, 线程跑完, 看门狗生效, 上下文管理器把目录清掉, 子进程被正常收割。
+    if _ACTIVE_CLI_TMPDIRS:
+        return
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
@@ -1526,8 +1530,13 @@ def validate_config(cfg):
         # 所以同样会静默顶替模型;此前此门只看顶层 member,fallback 里的 cli 链是漏的
         # (预审评审 #4)。按 merge 后的视图判——member 上的 auggie_model 会被继承,不算歧义。
         for j, fb in enumerate(m.get("fallback", []) or []):
-            if isinstance(fb, dict) and _ambiguous_auto_cli({**m, **fb}):
-                merged_model = {**m, **fb}.get("model")
+            # channel 必须按 fb 自己的值判(默认 api),【不能】从 member 继承——resolve_channel
+            # 正是这么分发的(`fch = fb.get("channel", "api")`)。继承会把 cli 席挂的 api fallback
+            # 误判成 cli 链并拒绝启动,报错还称它 channel=cli(预审评审 A1,启动即失败的误报)。
+            # 其余键(cli_kind / model / auggie_model)按 merge 视图判,那才是 _expand_cli 的真实输入。
+            fb_view = {**m, **fb, "channel": fb.get("channel", "api")} if isinstance(fb, dict) else {}
+            if _ambiguous_auto_cli(fb_view):
+                merged_model = fb_view.get("model")
                 sys.exit(f"[config] members[{i}] ({m.get('name')}) 的 fallback[{j}] channel=cli "
                          f"未写 cli_kind(=auto): 降级到这条链时会优先走 auggie 且只认 auggie_model,"
                          f"model={merged_model!r} 会被静默顶替成 auggie 默认模型,该席家族不可知。"
