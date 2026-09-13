@@ -3,6 +3,98 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.9.0] — 2026-09-13
+
+Closes ISSUE-012 — the per-seat usage ledger that `tasks/specs/degradation-budget.md` has been
+carrying as "the correct way to do what 1.7.0 withdrew". Mostly additive: new fields, no new
+rejection, and two deliberate narrowings of existing readings (`billed_members` and
+`billed_calls`, below).
+
+### Added
+- **`token_usage.wasted_tokens` / `wasted_members` are back, and this time they are right.** 1.7.0
+  shipped them and withdrew them the same day because pre-ship review showed they were wrong in
+  *both* directions at once: the single largest consumer — a reasoning model's truncation retries,
+  billing `max_tokens` 3000 → 6000 → 12000 for 21,300 tokens — lost its `usage` inside
+  `call_model`'s retry loop and reported **0**; and a provider that omits `usage` produced an
+  all-zero but *truthy* dict, counting a seat that spent nothing as `wasted_members: 1`.
+
+  The root cause was neither field. `usage` travelled in local variables along the *successful
+  return path*, which makes every exception path a discard point — and patching them one at a time
+  does not converge (round 1 patched `call_with_json_repair`; round 3 found the same hole one level
+  down in `call_model`). It is now a **ledger object**: every billed response is recorded the moment
+  it arrives, so however the stack unwinds, the entry is already made. Callers read it once at the
+  end instead of threading a value back up.
+
+  Recording early is necessary but not sufficient — pre-ship review caught the follow-on: the ledger
+  lives in the worker thread's frame, while a seat abandoned at the grace window is judged in the
+  *main* thread, which could not reach it. The stack had not unwound; the ledger was alive and simply
+  unreachable, so an 18,000-token seat was reported as zero waste. Each seat's ledger is now published
+  for the abandonment path to read — but only what has *already landed* by then. A single long call
+  still in flight when the window expires is still not counted, which is why the figure below is a
+  lower bound rather than a total.
+
+  `wasted_tokens` covers both a fully failed seat's entire spend and the failed links of a seat that
+  succeeded after degrading, and it is computed **per seat and clamped per seat** so that one
+  artifact with an inconsistent shape cannot cancel out another seat's real waste. It is **not**
+  folded into `total_tokens`, which keeps its existing meaning — "what the opinions cost" — because
+  the README's cost multiple is read against it. `wasted_members` counts only seats that were billed
+  and produced nothing; a seat that degraded and then succeeded is not one, though its burned links
+  are in `wasted_tokens`. Subscription seats (CH1, CH2 codex) have an empty ledger and appear in
+  neither. Both fields are reported for refine rounds too (`stats.r<N>.json`).
+
+  **Report it as a lower bound.** True spend is **at least** `total_tokens + wasted_tokens`. A seat
+  abandoned at the `grace_seconds` boundary keeps running in the background and keeps billing; its
+  ledger is read at the moment of abandonment, so anything it spends afterwards is not counted. An
+  artifact written by an older version has no ledger at all and contributes only what it
+  self-reports. A hand-written CH1 artifact contributes nothing even if it self-reports tokens —
+  CH1 runs on a subscription, so those tokens are not money, and counting them would push the
+  figure in the *other* direction.
+- **Per-seat artifacts gain `usage_total`** — everything that seat was billed, across every fallback
+  link and retry — alongside the existing `usage`, which still records only the link that produced
+  the opinion. Present on every per-seat artifact this version writes — member files, seats skipped at the
+  grace window, `--inject`ed CH1 seats, discussion-turn envelopes and `blindvote_<seat>.json` (the
+  closing blind vote is itself a billed call and carries its own ledger; `--inject`ed seats are
+  always zero, because CH1 runs on a subscription).
+
+### Fixed
+- **`billed_members` no longer counts seats that were never billed.** It filtered on the truthiness
+  of the `usage` dict; an all-zero dict from a provider that omits usage is truthy. It now filters on
+  the token count — *any* of `prompt_tokens` / `completion_tokens` / `total_tokens` being positive,
+  the same rule the ledger uses. Deliberately not `total_tokens` alone: `base_url` accepts any
+  OpenAI-compatible endpoint (vLLM, LiteLLM, a local gateway), and a response carrying only
+  prompt/completion counts would otherwise be judged "never billed" and have its real spend dropped
+  from the aggregate along with it.
+
+  `billed_calls` in `discuss_stats.json` had the identical defect and gets the identical fix, so
+  **two** existing readings change meaning in this release, both in the same direction: an all-zero
+  usage dict no longer counts as a billed call or a billed member.
+- **Four `raise` statements inside `except` blocks now chain with `from`**, so the underlying
+  `HTTPError` / `TimeoutExpired` / `ValueError` survives into the traceback instead of being replaced
+  by the translated error. Found by running `ruff --select B904` over the tree; see the note below on
+  why no lint gate ships with it.
+
+### Note on linting
+A lint gate was evaluated for CI and **deliberately not added**.
+
+Measured with `ruff 0.14.2 --isolated --no-cache --select E4,E7,E9,F` (the classic default set) over
+`skills/`, at the point v1.8.0 was tagged. It reported 6 findings in `moa.py`: one placeholder-free
+f-string and five deliberate semicolons. Widening to `B904` added 4 more. Those two rules are the
+only ones that carried signal, and both are fixed above, so they now report zero.
+
+Everything else the wider rule set surfaces is house style: `E501` line-too-long and `RUF00x`
+ambiguous-unicode, in the several hundreds and the couple of dozen respectively. No exact count is
+quoted here on purpose — both grow with every Chinese comment, so any number written down goes stale
+by the next commit, and the decision does not turn on the figure. `RUF00x` is firing on the `×` in
+prose like `链数 × timeout`, where it is correct.
+
+More to the point: **none of the eleven defects the v1.8.0 QA pass found would have been caught by
+it.** They were type, semantic and concurrency defects — a `None` reaching a format spec, an
+unhashable dict key, an uncaught decode error, a grace-window race, aggregation under the wrong mode.
+A gate here would fail on house style while staying silent on the class of defect that actually bites
+this project.
+
+tests 305 → 355.
+
 ## [1.8.0] — 2026-09-13
 
 A QA pass driven by actually running the CLI rather than reading it — seven rounds over the documented

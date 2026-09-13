@@ -245,7 +245,7 @@ class TransientError(Exception):
 
 def classify_http_error(e: urllib.error.HTTPError) -> Exception:
     if e.code == 429:
-        return TransientError(f"HTTP 429 rate limit", err_class="rate_limit")
+        return TransientError("HTTP 429 rate limit", err_class="rate_limit")
     if e.code >= 500:
         return TransientError(f"HTTP {e.code}", err_class="server")
     if e.code in (401, 403):
@@ -265,7 +265,8 @@ def _remaining(deadline) -> float:
 
 
 def call_model(cfg: dict, system: str, user: str, temperature: float,
-               max_tokens: int, timeout: int, retries: int = 2, deadline=None) -> tuple[str, dict]:
+               max_tokens: int, timeout: int, retries: int = 2, deadline=None,
+               ledger=None) -> tuple[str, dict]:
     """瞬态错误指数退避重试;永久错误立即抛出。空响应视为瞬态(Gemini 配额耗尽会静默吞 JSON)。
     截断修复(mem #10216): 推理模型(gemini-3.1-pro/gpt-5.6-sol)在 max_tokens 偏小时 reasoning
     吃光额度,content 空壳且 finish_reason=length——原样重试必然复现,故重试时倍增预算
@@ -295,6 +296,11 @@ def call_model(cfg: dict, system: str, user: str, temperature: float,
                 "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}]}, budget)
+            # 记账在【判断成败之前】(ISSUE-012): 这次 HTTP 200 已经计费了, 无论下面是
+            # 正常返回、还是判为截断后 raise 再重试 —— 截断路径正是最大的单个消耗点
+            # (实测 3000→6000→12000 = 21000 completion + 300 prompt = 21300), 旧代码在那条路上丢账。
+            if ledger is not None:
+                ledger.record(data.get("usage"))
             choice = (data.get("choices") or [{}])[0]
             content = choice.get("message", {}).get("content", "") or ""
             finish = choice.get("finish_reason") or choice.get("native_finish_reason") or ""
@@ -309,7 +315,7 @@ def call_model(cfg: dict, system: str, user: str, temperature: float,
         except urllib.error.HTTPError as e:
             err = classify_http_error(e)
             if isinstance(err, PermanentError):
-                raise err
+                raise err from e            # 保留底层 HTTPError, 便于排障时看到真实响应
             last_err = err
         except PermanentError:
             raise
@@ -324,6 +330,80 @@ def call_model(cfg: dict, system: str, user: str, temperature: float,
     raise last_err if last_err else TransientError("unknown failure")
 
 
+# 逐席账本的发布表(预审 BLOCKER/HIGH2)。账本建在 `_dispatch_channels` 里, 也就是 worker
+# 线程的栈帧上; 而"弃席"是 `dispatch_with_quorum` 在【主线程】判定的, 它只拿得到 member 配置。
+# 栈并没有展开、账本还活着 —— 只是没人拿得到, 于是一次真花了 18000 token 的运行会被 stats
+# 主动写成 wasted_tokens: 0。键用 member name(validate_config 已保证其唯一且非空)。
+# 并发: 每本账只有【一个写者】(该席自己的 worker), 读者只要一个下界, 故无需加锁——
+# `self.t += n` 并非单条原子字节码(LOAD/BINARY_OP/STORE), 单写者才是它安全的真正理由;
+# as_dict() 逐字段读, 可能拿到字段间互不自洽的快照(total 已含第 N 笔而 calls 还是 N−1),
+# 在下界语义下无害。被弃的线程仍在跑、还会继续计费, 所以弃席的账天然是【下界】。
+_SEAT_LEDGERS = {}
+
+
+class _UsageLedger:
+    """逐席计费账本(ISSUE-012)。
+
+    v1.7.0 曾加 `wasted_tokens`/`wasted_members` 又撤回,因为预审证明它两个方向同时错——根因
+    不是那两个字段,而是 **usage 靠局部变量沿【正常返回路径】传递**: 每条异常路径都是一个丢弃点。
+    逐点补丁修不完(补完 `call_with_json_repair`,下一层 `call_model` 的重试循环里还有同样的洞)。
+
+    账本反过来: 每收到一个【计费响应】就当场记账,此后栈怎么展开都不影响已记的数。调用方只在
+    最后读一次,不再负责把 usage 一层层传回来。
+
+    `record` 的返回值兼作"这次算不算花钱"的判据: provider 省略 usage 时 `_merge_usage({})` 会
+    产出全零【但为真】的 dict,旧代码据此把没花钱的席计成花了钱。全零即未计费,不记调用数。"""
+
+    __slots__ = ("prompt_tokens", "completion_tokens", "total_tokens", "calls")
+
+    def __init__(self):
+        self.prompt_tokens = self.completion_tokens = self.total_tokens = self.calls = 0
+
+    def record(self, usage) -> bool:
+        if not isinstance(usage, dict):
+            return False
+        p = _int_tokens(usage.get("prompt_tokens"))
+        c = _int_tokens(usage.get("completion_tokens"))
+        t = _billed_total(usage)             # provider 没给 total 就由 p+c 推(预审 D4)
+        if not t:
+            return False                     # 缺 usage 或全零 = 没花钱, 不记一次调用
+        self.prompt_tokens += p
+        self.completion_tokens += c
+        self.total_tokens += t
+        self.calls += 1
+        return True
+
+    def as_dict(self) -> dict:
+        return {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens, "calls": self.calls}
+
+
+def _int_tokens(v) -> int:
+    """token 计数收敛成非负 int。provider 偶尔给字符串或 null;bool 是 int 子类但语义不是计数。"""
+    if isinstance(v, bool) or v is None:
+        return 0
+    if isinstance(v, int):
+        return max(0, v)
+    if isinstance(v, float):
+        return _finite_int(v)
+    if isinstance(v, str):
+        try:
+            return _finite_int(float(v.strip()))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _finite_int(f: float) -> int:
+    """非有限浮点记 0 而不是抛。`json.loads` 默认接受非标准的 `Infinity`/`NaN` 字面量,而
+    `http_post` 与 `_read_artifact` 都是裸 `json.loads` —— 让 int(inf) 的 OverflowError
+    冒到顶,会在【全部委员 token 已经花完之后】把 stats 打成裸 traceback。同族的 _num/_str
+    在同样输入下都不抛,这一个不该例外(预审 MEDIUM6)。"""
+    if f != f or f in (float("inf"), float("-inf")):
+        return 0
+    return max(0, int(f))
+
+
 def _merge_usage(*usages) -> dict:
     """跨调用累加 usage(生成 + JSON 自修复各计一次)。缺字段按 0。"""
     out = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -331,7 +411,7 @@ def _merge_usage(*usages) -> dict:
         if not u:
             continue
         for k in out:
-            out[k] += u.get(k, 0) or 0
+            out[k] += _int_tokens(u.get(k))   # 字符串/None/inf 都收敛成 int(预审 D7)
     return out
 
 
@@ -357,12 +437,14 @@ def parse_json(text: str):
     return None
 
 
-def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=None, deadline=None):
+def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=None, deadline=None,
+                          ledger=None):
     """输出偶尔带解释性文字致 JSON 解析失败。花一次小成本让它自修复,而非丢弃该视角。
     schema 可为 None(system 里已含 schema 描述时),修复提示不重复附加。
     deadline: 与生成轮共享同一条链的挂钟预算(修 ISSUE-007)——修复轮吃的是这条链剩下的时间,
     剩余为 0 时 call_model 直接以 budget 类错误退出,把机会让给下一条 fallback。"""
-    raw, usage = call_model(cfg, system, user, temp, max_tokens, timeout, deadline=deadline)
+    raw, usage = call_model(cfg, system, user, temp, max_tokens, timeout, deadline=deadline,
+                            ledger=ledger)
     parsed = parse_json(raw)
     if parsed is not None:
         return raw, parsed, usage
@@ -370,7 +452,8 @@ def call_with_json_repair(cfg, system, user, temp, max_tokens, timeout, schema=N
         repair, usage2 = call_model(
             cfg,
             "你上一次的输出不是合法 JSON。把其中的实质内容原样转成合法 JSON,不要增删观点,不要解释。" + (schema or ""),
-            f"你上一次的输出:\n{raw}", 0.0, max_tokens, timeout, deadline=deadline)
+            f"你上一次的输出:\n{raw}", 0.0, max_tokens, timeout, deadline=deadline,
+            ledger=ledger)
     except Exception as e:
         # 修复轮抛错时,生成轮【已经计费】的 usage/raw 会随栈帧一起消失(预审评审 #1)。
         # ISSUE-007 之后这是常见路径而非罕见路径: 生成轮吃光链预算 → 修复轮的 budget<=0
@@ -431,8 +514,8 @@ def call_cli_codex(cfg, system, user, timeout):
             proc = subprocess.run(cmd, input=prompt.encode("utf-8"),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise TransientError(f"codex exec timeout after {timeout}s", err_class="timeout")
+        except subprocess.TimeoutExpired as e:
+            raise TransientError(f"codex exec timeout after {timeout}s", err_class="timeout") from e
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace")[:200]
             ec = "auth" if re.search(r"login|auth|credential|401|403", err, re.I) else "cli"
@@ -484,8 +567,8 @@ def call_cli_auggie(cfg, system, user, timeout):
         try:
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise TransientError(f"auggie timeout after {timeout}s", err_class="timeout")
+        except subprocess.TimeoutExpired as e:
+            raise TransientError(f"auggie timeout after {timeout}s", err_class="timeout") from e
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace")[:200]
             ec = "auth" if re.search(r"login|auth|credential|401|403", err, re.I) else "cli"
@@ -601,6 +684,11 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
                      "no api/cli fallback configured", "skipped_channel")
     timeout = member.get("timeout_seconds", opts["timeout_seconds"])
     t0 = time.time()
+    # 逐席账本(ISSUE-012): 建在链循环【之外】, 跨全部 fallback 链与它们各自的重试累计。
+    # 它记的是"这一席总共被计了多少费", 与 result["usage"]("换回意见的那条链花了多少")
+    # 是两个口径 —— 后者是 README 成本倍数的既有读数, 不能被改写(ISSUE-010 的取舍)。
+    ledger = _UsageLedger()
+    _SEAT_LEDGERS[member["name"]] = ledger   # 发布出去, 供主线程的弃席路径读取
     last = None
     for idx, (kind, ccfg, note) in enumerate(tries):
         # 每条 fallback 链各自一份挂钟预算(修 ISSUE-007): timeout_seconds 的语义从「每次 HTTP
@@ -635,7 +723,8 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
             else:
                 raw, parsed, usage = call_with_json_repair(
                     ccfg, system, user, member.get("temperature_generate", default_temp),
-                    opts["max_tokens_member"], timeout, None, deadline=link_deadline)
+                    opts["max_tokens_member"], timeout, None, deadline=link_deadline,
+                    ledger=ledger)
                 if parsed is None:
                     # 与 cli 分支对齐(修 ISSUE-006): 修复轮后仍不可解析 = 这条通道没产出可用意见,
                     # 必须继续降级。旧代码在此直接 return parsed=None 占掉整席,后续 fallback 全部
@@ -647,20 +736,23 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
                                  f"(model={link_model})",
                                  "parse", t0, usage=usage, raw=raw,
                                  model_used=link_model, channel_used=link_label,
-                                 protocol=link_protocol)
+                                 protocol=link_protocol, usage_total=ledger.as_dict())
                     continue
             return {
                 "name": member["name"], "seat": seat, "role": role_key,
                 "model_used": link_model,  # codex 席可省 model(用 codex 默认)→ None,非 KeyError
                 "protocol": link_protocol,
                 "channel_used": link_label,
-                "raw": raw, "parsed": parsed, "usage": usage, "latency_s": round(time.time() - t0, 1),
+                "raw": raw, "parsed": parsed, "usage": usage,
+                "usage_total": ledger.as_dict(),   # 本席全部计费(含失败链与重试), 见 ISSUE-012
+                "latency_s": round(time.time() - t0, 1),
                 "error": None if parsed else "output not parseable", "err_class": None,
             }
         except PermanentError as e:
             last = _fail(member, role_key, f"{e} [{e.err_class}] {e.hint}".strip(), e.err_class, t0,
                          usage=getattr(e, "usage", None), raw=getattr(e, "raw", ""),
-                         model_used=link_model, channel_used=link_label, protocol=link_protocol)
+                         model_used=link_model, channel_used=link_label, protocol=link_protocol,
+                         usage_total=ledger.as_dict())
             continue  # 永久错误: 直接试下一个 fallback,不重试
         except Exception as e:
             ec = getattr(e, "err_class", "unknown")
@@ -670,9 +762,16 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
             # 修复轮抛错时, 账与原始输出都在这里取回, 不随栈帧丢掉。
             last = _fail(member, role_key, f"{e} [{ec}]", ec, t0,
                          usage=getattr(e, "usage", None), raw=getattr(e, "raw", ""),
-                         model_used=link_model, channel_used=link_label, protocol=link_protocol)
+                         model_used=link_model, channel_used=link_label, protocol=link_protocol,
+                         usage_total=ledger.as_dict())
             continue
-    return last or _fail(member, role_key, "all channels failed", "unknown", t0)
+    if last is not None:
+        # 末链之后再取一次快照: 链内 _fail 拿到的是当时的账本, 之后若还有计费(如末链的
+        # 修复轮)不会反映在里面。纯 api/cli 路径上两者通常相等, 但取最新的总没错。
+        last["usage_total"] = ledger.as_dict()
+        return last
+    return _fail(member, role_key, "all channels failed", "unknown", t0,
+                 usage_total=ledger.as_dict())
 
 
 _budget_hint_shown = False
@@ -827,7 +926,9 @@ def _turn_envelope(res: dict, round_no: int) -> dict:
         "round": round_no, "seat": res.get("seat", "?"), "name": res.get("name"),
         "role": res.get("role"), "channel_used": res.get("channel_used"),
         "model_used": res.get("model_used"), "turn": res.get("parsed"),
-        "usage": res.get("usage"), "latency_s": res.get("latency_s", 0.0),
+        "usage": res.get("usage"),
+        "usage_total": res.get("usage_total") or _UsageLedger().as_dict(),
+        "latency_s": res.get("latency_s", 0.0),
         "error": res.get("error"), "err_class": res.get("err_class"),
     }
 
@@ -836,7 +937,7 @@ _UNSET = object()
 
 
 def _fail(member, role_key, msg, err_class, t0=None, usage=None, raw="",
-          model_used=_UNSET, channel_used=None, protocol=_UNSET):
+          model_used=_UNSET, channel_used=None, protocol=_UNSET, usage_total=None):
     """失败席结果。
 
     usage/raw(修 ISSUE-006): 已发出并计费的调用即便产出不可用,也要把 token 用量与原始文本留在
@@ -852,6 +953,9 @@ def _fail(member, role_key, msg, err_class, t0=None, usage=None, raw="",
         "model_used": member.get("model") if model_used is _UNSET else model_used,
         "protocol": member.get("protocol", "openrouter") if protocol is _UNSET else protocol,
         "channel_used": channel_used, "raw": raw, "parsed": None, "usage": usage,
+        # usage_total: 本席全部计费(ISSUE-012)。失败席正是漏账最严重的地方——白花的钱
+        # 恰在出问题时最该被看见。非调度路径(如纯 subagent 跳过)没有账本, 记零。
+        "usage_total": usage_total if usage_total is not None else _UsageLedger().as_dict(),
         "latency_s": round(time.time() - t0, 1) if t0 else 0.0,
         "error": msg, "err_class": err_class,
     }
@@ -931,6 +1035,8 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     进程收尾可能再等落伍席一小段(上界 = member 级 timeout,不无限拖尾)。要连进程退出也
     界定需改 daemon 线程,但那会硬杀在途 HTTP,得不偿失,故不做。"""
     results = {}
+    for _m in members:                       # 清掉上一轮的陈旧账本, 免得跨轮串账
+        _SEAT_LEDGERS.pop(_m.get("name"), None)
     ex = ThreadPoolExecutor(max_workers=max(1, len(members)))
     abandoned = False
     try:
@@ -949,6 +1055,8 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                 m = futs[fut]
                 r = fut.result()
                 results[m["name"]] = r
+                # 收完即清: 纯卫生(表不只进不出), 不是正确性 —— 正确性由入口的清表保证。
+                _SEAT_LEDGERS.pop(m.get("name"), None)
                 if on_done:
                     on_done(r)
                 if r.get("parsed"):
@@ -984,7 +1092,7 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                         if r.get("parsed"):
                             ok += 1
                     else:
-                        r = _skipped_grace(m)
+                        r = _skipped_grace(m, _SEAT_LEDGERS.get(m.get("name")))
                         fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
                         abandoned = True
                         global _ABANDONED_STRAGGLERS  # 供 main() 干净路径上的快速退出(修 ISSUE-009)
@@ -999,12 +1107,15 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
     return [results[m["name"]] for m in members if m["name"] in results]
 
 
-def _skipped_grace(member):
+def _skipped_grace(member, ledger=None):
+    """宽限窗到期被弃的席。ledger 由 dispatch_with_quorum 从发布表取出后显式传入 —— 本函数
+    不自己读模块全局, 否则直调时结果取决于别处留下的残留(预审 D5b: 测试里已经发生过)。"""
     role_key = member.get("role", "?")
     return {
         "name": member["name"], "seat": member.get("seat", "?"), "role": role_key,
         "model_used": member.get("model"), "protocol": member.get("protocol", "openrouter"),
-        "channel_used": None, "raw": "", "parsed": None, "usage": None, "latency_s": 0.0,
+        "channel_used": None, "raw": "", "parsed": None, "usage": None,
+        "usage_total": (ledger or _UsageLedger()).as_dict(), "latency_s": 0.0,
         "error": "skipped: quorum reached, grace period expired", "err_class": "skipped_grace",
     }
 
@@ -1071,19 +1182,93 @@ def load_members(collect_dir: Path, round_no: int = 0):
 
 def _aggregate_usage(ok_results: list) -> dict:
     """汇总本轮计费席(CH3 API)的 token 用量;订阅席(CH1/CH2)usage=None 不计入。
-    billed_members 为有 usage 的席位数,供成本折算与倍数计算用。
+    billed_members 为有【实际 token 计费】的席位数(判据 `_billed_total`, 不是 dict 真值),
+    供成本折算与倍数计算用。
 
-    失败席已计费但没换回意见的花销【不在此处汇总】。v1.7.0 曾加过 wasted_tokens/wasted_members
-    两个字段,预审评审证明它两个方向同时错而被撤回: ① 最大的单个 token 消耗点——call_model
-    截断重试(实测 3000→6000→12000,合计 21000)——在重试循环里就把 usage 丢了,根本到不了这里,
-    于是报 0;② provider 省略 usage 时 _merge_usage({}) 产出全零【但为真】的 dict,使没花钱的席
-    被计成 wasted_members=1。根因是 usage 靠局部变量沿正常返回路径传递,每条异常路径都是丢弃点,
-    逐点打补丁修不完。正确修法是逐席累加器(栈怎么展开都不影响已记的账),留到后续版本单独做。
-    逐席产物里的 usage 仍尽力保留(见 _fail),但那是尽力而为,不对外承诺完整性。"""
-    billed = [r for r in ok_results if r.get("usage")]
+    失败席已计费但没换回意见的花销【不在此处汇总】——那部分见 `_wasted_usage`(ISSUE-012),
+    单列为 wasted_tokens/wasted_members, 刻意不并入本函数的 total_tokens: 后者是"换回了意见的
+    成本", README 的成本倍数按这个口径读。
+
+    历史: v1.7.0 曾加过这两个字段又同日撤回, 因为它们两个方向同时错——最大的单个消耗点
+    (截断重试)在 call_model 的重试循环里就把 usage 丢了、报 0; 而 provider 省略 usage 时
+    _merge_usage({}) 产出全零【但为真】的 dict, 把没花钱的席计成花了。根因是 usage 靠局部变量
+    沿正常返回路径传递, 每条异常路径都是丢弃点。v1.9.0 用逐席账本(_UsageLedger)修掉根因后
+    才重新引入。
+    """
+    # 按【实际 token 数】判而非 dict 真值: provider 省略 usage 时 _merge_usage({}) 会产出
+    # 全零【但为真】的 dict, 旧条件把没花钱的席也计进 billed_members(v1.7.0 撤回的原因之二)。
+    # 判据与 _UsageLedger.record 一致 —— 任一字段为正即算计费, 不能只看 total_tokens:
+    # base_url 可配成任何 OpenAI 兼容端点(vLLM / LiteLLM / 本地网关), 只给 prompt/completion
+    # 的形状一旦被判为"没花钱", 连已花掉的 p/c 也会随 billed 列表一起从聚合里消失(预审 HIGH4b)。
+    billed = [r for r in ok_results if _has_billed_tokens(r.get("usage"))]
     agg = _merge_usage(*(r["usage"] for r in billed))
     agg["billed_members"] = len(billed)
     return agg
+
+
+def _is_subscription_seat(r) -> bool:
+    """这一席跑的是不计费通道吗。CH1 由仲裁人脚本外派发(protocol 记 subagent),
+    CH2 codex 走订阅。只用于"缺账本时要不要回落到自报 usage"的判断。"""
+    if r.get("protocol") == "subagent":
+        return True
+    ch = r.get("channel_used")
+    return isinstance(ch, str) and (ch.startswith("subagent") or ch.startswith("cli:codex"))
+
+
+def _billed_total(usage) -> int:
+    """这份 usage 代表花掉的 token 数 —— 四处判据(账本记账 / billed_members / billed_calls /
+    wasted_*)的【唯一来源】,免得它们各自漂开(预审 D4: 前三处已统一, _wasted_usage 还在只看
+    total_tokens, 于是只回 prompt/completion 的端点上一席会"被判计了费却永远不可能被判白花")。
+
+    `total_tokens` 为正就用它;否则由 prompt+completion 推 —— base_url 可配成任何 OpenAI 兼容
+    端点(vLLM / LiteLLM / 本地网关), 只回 p/c 的形状不能被当成"没花钱"。"""
+    if not isinstance(usage, dict):
+        return 0
+    t = _int_tokens(usage.get("total_tokens"))
+    if t:
+        return t
+    return _int_tokens(usage.get("prompt_tokens")) + _int_tokens(usage.get("completion_tokens"))
+
+
+def _has_billed_tokens(usage) -> bool:
+    """这份 usage 是否代表"真花了钱"。"""
+    return _billed_total(usage) > 0
+
+
+def _wasted_usage(all_results: list) -> dict:
+    """白花的计费(ISSUE-012 重新引入 v1.7.0 撤回的 wasted_*)。
+
+    定义: 逐席算 `max(0, 本席总计费 − 本席换回意见的那条链的计费)` 再求和。逐席夹而非在总和上
+    夹 —— 否则一份口径异常的产物会产生负贡献, 抵掉别席的真实浪费(预审 MEDIUM5)。
+    于是它既覆盖"整席全败"(总账全算白花), 也覆盖"前两条链烧完才降级成功"(失败链算白花)。
+
+    不并入 token_usage.total_tokens: 后者是"换回了意见的成本", README 的成本倍数按这个口径
+    读, 改它等于悄悄改写既有结论(ISSUE-010 的取舍, 此处沿用)。
+
+    wasted_members 只数【计了费却没产出意见】的席 —— 降级后成功的席不算"白花的席",
+    它的浪费已计入 wasted_tokens。订阅席(CH1/CH2 codex)总账为零, 自然不计。"""
+    wasted = 0
+    dead = 0
+    for r in all_results:
+        bought = _billed_total(r.get("usage")) if _parsed_ok(r) else 0
+        if isinstance(r.get("usage_total"), dict):
+            spent = _billed_total(r["usage_total"])
+        elif _is_subscription_seat(r):
+            # 订阅席(CH1 子代理 / CH2 codex)自报的 token 不是钱。缺 usage_total 时若也回落到
+            # 自报值, 一份手写的 CH1 失败产物会被记成白花了 9999 —— 上一版在这里欠报 0,
+            # 回落修法把方向翻成虚报(预审 D3)。两个方向都可能错的成本字段比没有更糟。
+            spent = 0
+        else:
+            # 缺 usage_total 键 = 这份产物不是本版写的(仲裁人手写的 CH1 席, 或 collect-dir 里
+            # 残留的旧产物)。回落到它自报的 usage —— 但只在它【自己声明了通道】时: 真实的
+            # v1.8.0 产物一律带 channel_used(_fail 与成功分支都显式传 link_label), 而连通道都
+            # 没写的手写产物无从判断那是不是钱。下界契约下宁可少算不可多算(预审 R2)。
+            ch = r.get("channel_used")
+            spent = _billed_total(r.get("usage")) if isinstance(ch, str) and ch else 0
+        wasted += max(0, spent - bought)      # 逐席夹, 不在总和上夹
+        if not _parsed_ok(r) and spent:
+            dead += 1
+    return {"wasted_tokens": wasted, "wasted_members": dead}
 
 
 def _parsed_ok(r) -> bool:
@@ -1187,7 +1372,8 @@ def compute_stats(mode: str, results: list) -> dict:
                     "ok": _parsed_ok(r)} for r in results],
         "failures": [{"name": r["name"], "err_class": r.get("err_class"), "error": r.get("error")}
                      for r in failed],
-        "token_usage": _aggregate_usage(ok),
+        # wasted_* 单列, 不并入 total_tokens(见 _wasted_usage 的口径说明)
+        "token_usage": {**_aggregate_usage(ok), **_wasted_usage(results)},
     }
     if mode == "review":
         sev = {"blocker": 0, "high": 0, "medium": 0, "low": 0}
@@ -1270,7 +1456,10 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
     base: dict = {
         "round_members_ok": len(ok),
         "round_members_failed": len(rd_failed),
-        "token_usage": _aggregate_usage(ok),   # 本精炼轮计费席 token 增量,供成本增量观测
+        # 精炼轮同样会在失败链上烧钱(同一份 roster、同一条 fallback 链, 生成轮会降级的席
+        # 这里几乎必然再降级一次), 故 wasted_* 一并汇总, 否则 SKILL.md「两个数都报」在
+        # stats.r<N>.json 上无法执行(预审 HIGH3)。
+        "token_usage": {**_aggregate_usage(ok), **_wasted_usage(refine_results)},
     }
     if mode == "review":
         stance = {"validate": 0, "challenge": 0, "abstain": 0}
@@ -1406,8 +1595,10 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
         "dissent_preserved": dissent,
         # 讨论按回合计费(同席多轮各计一次),故用 billed_calls 而非 billed_members(修 C6:
         # review/refine 的 billed_members 是每席一次=席位数;讨论一席多回合,计的是计费调用次数)。
+        # billed_calls 与 billed_members 同源判据: dict 真值会把 provider 省略 usage 时的
+        # 全零 dict 算成一次计费调用(预审 MEDIUM9 —— 正是本版声称修掉的缺陷, 换了个函数而已)。
         "token_usage": {**_merge_usage(*usages),
-                        "billed_calls": sum(1 for u in usages if u)},
+                        "billed_calls": sum(1 for u in usages if _has_billed_tokens(u))},
     }
 
 
@@ -1960,14 +2151,18 @@ def cmd_refine(args, cfg):
 
 
 def _inject_result(member, mode, parsed) -> dict:
-    """把仲裁人外派发的 CH1 子代理 JSON 规约成 _dispatch_channels 同形结果(供 --inject)。"""
+    """把仲裁人外派发的 CH1 子代理 JSON 规约成结果形状(供 --inject)。
+
+    键集与 _dispatch_channels 的成功结果一致(含 usage_total, 恒为零账本——CH1 走订阅, 不计费),
+    但 raw/latency_s 只能尽力填: 这一席的调用发生在脚本之外。"""
     role_key = _seat_role(member, mode)
     return {
         "name": member["name"], "seat": member.get("seat", "?"), "role": role_key,
         "model_used": member.get("model"), "protocol": member.get("protocol", "subagent"),
         "channel_used": "subagent (arbiter-dispatched)",
         "raw": json.dumps(parsed, ensure_ascii=False) if parsed else "",
-        "parsed": parsed, "usage": None, "latency_s": 0.0,
+        "parsed": parsed, "usage": None, "usage_total": _UsageLedger().as_dict(),
+        "latency_s": 0.0,
         "error": None if parsed else "inject parse failed",
         "err_class": None if parsed else "inject_parse",
     }
@@ -2066,6 +2261,9 @@ def cmd_discuss_blindvote(args, cfg):
     bv = {"seat": res.get("seat"), "name": res.get("name"), "role": res.get("role"),
           "channel_used": res.get("channel_used"), "model_used": res.get("model_used"),
           "vote": res.get("parsed"), "usage": res.get("usage"),
+          # 盲投也是真计费的 CH3 调用、也走 fallback 链: 漏了这个键, 同一场讨论的
+          # discussion.jsonl 有账而 blindvote_<seat>.json 没账(预审 D1)。
+          "usage_total": res.get("usage_total") or _UsageLedger().as_dict(),
           "error": res.get("error"), "err_class": res.get("err_class")}
     out = collect / f"blindvote_{_safe_name(str(res.get('seat')))}.json"  # 修 N4: seat 也过路径穿越门
     # 纵深防御(ISSUE-004): 即便绕过入口 seat 唯一门,落盘前再核对——若该 seat 的盲投已被【别的 name】占用,
@@ -2136,8 +2334,8 @@ def _round_at_least(minimum, note=""):
     def _conv(s):
         try:
             v = int(s)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"需为整数,收到 {s!r}")
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(f"需为整数,收到 {s!r}") from e
         if v < minimum:
             # note 按调用方给: "第 0 轮就是生成轮本身"对 refine 成立, 对 discuss 不成立
             # ——开会讨论没有生成轮, 照抄会是一句假话(预审 L3)。

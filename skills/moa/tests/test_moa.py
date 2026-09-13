@@ -1006,21 +1006,24 @@ def test_stats_token_usage_billed_only():
 
 
 def test_stats_token_usage_counts_successful_seats_only():
-    """token_usage 只汇总【换回了意见】的席。v1.7.0 曾加 wasted_* 汇总失败席的白花钱,
-    预审评审证明它两个方向同时错(截断重试在 call_model 循环里就丢了 usage → 21000 报成 0;
-    provider 省略 usage 时 _merge_usage({}) 全零却为真 → 没花钱的席计成 wasted_members=1),
-    故撤回。此用例钉住撤回后的口径: 失败席带 usage 也不进 token_usage,且不得冒出 wasted_* 字段——
-    一个两个方向都错的成本字段比没有更糟,用户会信它。"""
+    """`total_tokens` 的口径始终是【换回了意见的成本】—— README 的成本倍数按它读,
+    ISSUE-012 重新引入 wasted_* 时也不得改写它(只加字段,不动既有字段语义)。
+
+    v1.7.0 曾加 wasted_* 又撤回,因为它两个方向同时错(截断重试在 call_model 循环里就丢了
+    usage → 21000 报成 0;provider 省略 usage 时 _merge_usage({}) 全零却为真 → 没花钱的席
+    被计成 wasted_members=1)。ISSUE-012 用逐席账本修掉根因后才重新引入,见
+    test_stats_reports_wasted_spend_without_touching_existing_totals。"""
     ok = _res("a", "A", {"verdict": "pass", "confidence": 0.5, "issues": []})
     ok["usage"] = {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
+    ok["usage_total"] = {"total_tokens": 140, "calls": 1}
     burned = _res("b", "B", None, err_class="parse")      # 已计费却没产出
     burned["usage"] = {"prompt_tokens": 60, "completion_tokens": 20, "total_tokens": 80}
+    burned["usage_total"] = {"total_tokens": 80, "calls": 1}
     tu = moa.compute_stats("review", [ok, burned])["token_usage"]
-    assert tu["total_tokens"] == 140          # 只算成功席
+    assert tu["total_tokens"] == 140          # 只算成功席, 不因 wasted_* 的引入而变
     assert tu["billed_members"] == 1
-    assert "wasted_tokens" not in tu and "wasted_members" not in tu
-    # 逐席产物里仍尽力保留(不承诺完整), 供后续累加器重构接手
-    assert burned["usage"]["total_tokens"] == 80
+    assert tu["wasted_tokens"] == 80          # 失败席的 80 单列, 不并入上面的 140
+    assert tu["wasted_members"] == 1
 
 
 def test_stats_separates_skipped_from_real_failures():
