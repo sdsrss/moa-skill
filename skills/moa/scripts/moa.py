@@ -209,6 +209,106 @@ def http_post(url: str, headers: dict, payload: dict, timeout: int) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_MODEL_LIST_TIMEOUT = 5
+
+
+def fetch_openrouter_models(timeout=None):
+    """取 OpenRouter 在线模型 id 集合;任何失败都回 None。
+
+    **不带 Authorization**:该端点实测不需要 key(HTTP 200,445 个模型),没必要把 key 送到一个
+    不需要它的地方。**fail-soft 是硬要求**:这是可发现性工具,不是门禁——离线、气隙、端点改版、
+    超时,一律降级成 dry-run 里的一行说明,绝不阻断预演(见 tasks/specs/model-preflight.md)。
+
+    timeout 取 5s 而非 15s:连接被**拒绝**(RST)是毫秒级,但被**黑洞**(企业出口过滤 / 丢包)时
+    要走满超时,而 dry-run 是 SKILL.md 教仲裁人当着用户的面跑的那一条,15s 静默停顿在交互里是可见的
+    (预审 M1 实测 15.1s)。5s 是"够慢的网也能拿到 445 条列表"与"卡住也不至于让人以为挂了"之间的取舍。
+    """
+    # 在【运行时】取常量而不是写进默认参数:默认参数在 def 时求值,与常量脱钩后测不出来
+    # (而且 `default is 5` 因小整数驻留恒真,钉不住)。预审 delta-2 L5。
+    timeout = _MODEL_LIST_TIMEOUT if timeout is None else timeout
+    try:
+        req = urllib.request.Request(_OPENROUTER_MODELS_URL,
+                                     headers={"accept": "application/json"}, method="GET")
+        with _opener_for(_OPENROUTER_MODELS_URL).open(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        ids = {m.get("id") for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")}
+        return ids or None
+    except Exception:
+        return None
+
+
+def _expand_links(cfg):
+    """展开每席的主链 + fallback,产出 `(label, link_view, decision_channel)`。
+
+    **通道判据与 `resolve_channel` 逐字一致**:主链看 `member.get("channel", "api")`,fallback 看
+    **`fb` 自己写的** `fb.get("channel", "api")`——**不是** `{**member, **fb}` 里从 member 继承来的
+    那个。merge 视图只用于取该链真正会发出去的 model / protocol / base_url。
+
+    这两者混用就是 v1.7.0 A1 那条阻断级缺陷的口径错误:当年按 merge 判 channel 造成**误拒**
+    (合法 config 启动即失败,同日发 v1.7.1 回滚);在这里按 merge 判则造成**漏检**——
+    「cli 席 + 省略 channel 的 fallback」实跑是 api 链、会把 auggie 侧的模型名发给 OpenRouter,
+    却被静默标成 skip,而那恰恰是本功能存在的理由那一类。
+    `test_validate_config_allows_fallback_that_omits_channel` 把「省略 channel = api」钉成契约。
+    """
+    for m in (cfg.get("members") or []):
+        if not isinstance(m, dict):
+            continue
+        label = f"{_cell(m.get('name'))}(seat {_cell(m.get('seat'), '?')})"
+        yield label, m, m.get("channel", "api")
+        for i, fb in enumerate(m.get("fallback") or [], start=1):
+            if not isinstance(fb, dict):
+                continue
+            yield f"{label} fallback#{i}", {**m, **fb}, fb.get("channel", "api")
+
+
+def check_model_slugs(cfg, live_ids):
+    """逐链判断 model slug 状态,返回 [(label, status, detail)]。
+
+    status: `ok`(在线列表里有) · `unknown`(没有——可能已下线或拼错) · `missing`(api 链没写
+    model,与 call_model 的 startup 报错同源) · `skipped`(无法比对)。
+
+    只比对 **protocol=openrouter(默认)且未自定义 base_url** 的 api 链。其余一律 skipped:
+    cli / subagent 链本就不用 OpenRouter slug;OpenAI 兼容端点与自建网关(vLLM / LiteLLM)有自己的
+    模型名空间,拿 OpenRouter 的列表去判会**全是假警报**——那比不检查更糟。
+    """
+    rows = []
+    for label, link, channel in _expand_links(cfg):
+        if channel != "api":
+            rows.append((label, "skipped", f"channel={channel},不用 OpenRouter slug"))
+            continue
+        if link.get("protocol", "openrouter") != "openrouter":
+            rows.append((label, "skipped", f"protocol={link.get('protocol')},模型名空间不同"))
+            continue
+        if link.get("base_url"):
+            rows.append((label, "skipped", "自定义 base_url,模型名由该端点决定"))
+            continue
+        model = link.get("model")
+        if not model:
+            # 显式 `model: null` 与"压根没写"同判 missing:两者跑起来都会以 err_class=startup 失败。
+            # 出厂配置在 cli fallback 上就用 model: null,这个写法落到 api 链上并非天方夜谭(预审 L2)。
+            rows.append((label, "missing", "api 链未写 model —— 跑起来会以 err_class=startup 失败"))
+        elif not isinstance(model, str):
+            # validate_config 不校验 model 的【类型】,`model: 123` / `true` / `[a, b]` 一律放行。
+            # 没有这道门时 `model in live_ids` 会在 list/dict 上 unhashable 崩、`":" in model` 会在
+            # int/bool 上 TypeError —— 把整个 dry-run 掀掉(预审 delta B1)。它们跑起来也发不出去,
+            # 按"这个 slug 不对"报即可。与 dry-run 其余字段的 _cell() 兜底同一口径。
+            rows.append((label, "unknown",
+                         f"model 不是字符串({type(model).__name__}: {model!r}),不是合法 slug"))
+        elif model in live_ids:
+            rows.append((label, "ok", model))
+        else:
+            # 不做「剥掉 `:suffix` 再比基座 id」的回落:当天 445 条里含冒号的 96 条只有 `:batch` /
+            # `:free` 两种后缀、且都是真实 id(走上面的精确匹配),那条回落兜不到任何真实形态,
+            # 却会把 `openai/gpt-5.6-sol:typo` 乃至光秃秃的尾随冒号洗成 ok —— 假阴性比假警报更糟,
+            # 因为它让用户以为查过了(预审 delta D-M1)。带冒号时只在文案里多给一句提示。
+            base = model.rsplit(":", 1)[0] if ":" in model else ""
+            hint = f";若这是路由后缀写法,基座 id 可能是 {base}" if base else ""
+            rows.append((label, "unknown",
+                         f"{model} 不在 OpenRouter 在线列表(已下线?拼错?){hint}"))
+    return rows
+
+
 def endpoint_and_headers(cfg: dict):
     proto = cfg.get("protocol", "openrouter")
     key_env = cfg.get("api_key_env") or (
@@ -277,6 +377,19 @@ def call_model(cfg: dict, system: str, user: str, temperature: float,
     (实测 3 条 api 链 × 3 次尝试 × 240s = 2169s ≈ 36 分钟)。收紧的是【挂钟】不是【重试策略】:
     快速失败(如 429 秒回)时预算几乎不消耗,重试次数与旧版一致。None = 不设限(直接调用本函数
     的库/测试保持旧行为)。"""
+    # 前置条件检查,与 cli 分支对称(call_cli_codex / call_cli_auggie 开头查二进制在不在 PATH):
+    # 这条链根本没法试,不是"试了失败"。旧代码在下面的 payload 里用 `cfg["model"]` 裸下标,
+    # 于是缺 model 的 api 席抛 KeyError、被 _dispatch_channels 的 except Exception 接住,用户拿到
+    # 的字面就是 `'model' [unknown]` —— 和"这席没写 model"零字面关联,err_class 还污染错误分类表。
+    # 不在 validate_config 加硬门: `{"name": "a", "channel": "api"}`(不写 model)是
+    # test_validate_config_accepts_valid 钉住的合法配置,加门会撞掉 22 条用例、其中 4 条契约用例,
+    # 且 base_url 指向单模型网关时省略 model 是合理写法(见 tasks/specs/model-preflight.md)。
+    # 行为不变:仍是 PermanentError → continue 到下一条 fallback,不占席。
+    if not cfg.get("model"):
+        raise PermanentError(
+            "api link has no model configured", err_class="startup",
+            hint="给这一席(或这条 fallback)写上 model: <slug>;可省 model 的只有 cli 席。"
+                 "用 `dry-run` 先核对 slug 是否还在线。")
     url, headers = endpoint_and_headers(cfg)
     last_err = None
     cur_max = max_tokens
@@ -1779,7 +1892,53 @@ def _cell(v, dflt=""):
     return dflt if v is None else str(v)
 
 
-def dry_run(cfg, mode, material, topic, refine_rounds):
+def _render_model_check(rows, live_count=None):
+    """打印预检结果。与判定一起被 `_print_model_check` 的 try/except 裹住——spec 承诺的是
+    「预检绝不阻断 dry-run」,壳只盖判定、不盖打印的话,这个承诺就得靠"打印段恰好不会抛"维持
+    (例如 `mark` 映射取不到的状态会 KeyError 掀掉整个 dry-run)。预审 delta-2 L2。"""
+    if not rows:
+        return
+    scope = f"对 {live_count} 个 OpenRouter 在线模型比对;" if live_count is not None else ""
+    print(f"\nmodel 预检({scope}"
+          f"cli/subagent 席、自定义 base_url、非 openrouter 协议不参与):")
+    for label, status, detail in rows:
+        mark = {"ok": "OK     ", "unknown": "UNKNOWN", "missing": "MISSING",
+                "skipped": "skip   "}[status]
+        print(f"  {mark} {label:<34} {detail}")
+    bad = [r for r in rows if r[1] in ("unknown", "missing")]
+    if bad:
+        print(f"  ↑ {len(bad)} 条链现在就能看出会失败,建议先修 config 再正式跑——"
+              f"它们在正式运行里会烧掉其余席位的钱之后才暴露。")
+
+
+def _print_model_check(cfg):
+    """dry-run 的 slug 预检:在花钱之前把「model 写错 / 已下线 / 没写」摆出来。
+
+    README 一直写着「Model IDs churn fast; verify once with dry-run before a real run」,但在此之前
+    dry-run 对 model ID 一个字都不校验——这句话是假的。现在它成真了。
+    """
+    live = fetch_openrouter_models()
+    if live is None:
+        print(f"\nmodel 预检: 跳过(没能拿到 OpenRouter 在线模型列表——离线 / 出口被拦 / 超过 "
+              f"{_MODEL_LIST_TIMEOUT}s / 端点返回的形状不对)。这不影响本次预演,退出码不变;"
+              f"用 --no-model-check 可以永久关掉这一步。")
+        return
+    try:
+        _render_model_check(check_model_slugs(cfg, live), len(live))
+    except Exception as e:
+        # 结构性兜底,不是第二扇门:spec 承诺的是「预检绝不阻断 dry-run」,而此前那个承诺只覆盖了
+        # 取列表那一次网络调用,判定逻辑里任何一次类型假设不成立就会掀掉整个 dry-run(delta B1:
+        # `model: 123` 让退出码从 0 变 1)。逐点补 isinstance 修不完——config 的每个字段都可以是
+        # 任意 YAML 类型,这与 ISSUE-012「逐点补丁修不完异常路径,要换结构性收口」同源。
+        print(f"\nmodel 预检: 跳过(判定时出错: {type(e).__name__}: {e})。"
+              f"这不影响本次预演,退出码不变;请检查 config 里 model / protocol / base_url 的写法。")
+        return
+
+
+def dry_run(cfg, mode, material, topic, refine_rounds, model_check=False):
+    """model_check 默认 False:发不发那次 GET 是 **CLI 边界** 的决定,不是本函数的。
+    默认 True 会让每个直接调 dry_run 的用例都真连网——违反仓库「测试全离线」硬不变量,
+    且把 1.8s 的套件拖到 12s。cmd_dry_run 按 --no-model-check 显式传 True。"""
     members = cfg["members"]
     n = len(members)
     print(f"=== DRY RUN ({mode}) ===")
@@ -1813,6 +1972,8 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
           "首选订阅席若降级到计费通道,计费面也会比上面这行大。")
     print("收敛由当前 agent(仲裁人)完成,不计外部调用。")
     print(f"proxy: {'via ' + str(PROXIES) if PROXIES else 'no env proxy, direct'}")
+    if model_check:
+        _print_model_check(cfg)
     warn_sensitive_material(material)  # 外发前敏感信息扫描,检出即脱敏告警
     print("确认无误后去掉 dry-run 正式运行。")
 
@@ -2367,7 +2528,8 @@ def cmd_discuss_stats(args, cfg):
 
 def cmd_dry_run(args, cfg):
     material = _read_input(args.input) if args.input else ""
-    dry_run(cfg, args.mode, material, args.topic, args.refine_rounds)
+    dry_run(cfg, args.mode, material, args.topic, args.refine_rounds,
+            model_check=not getattr(args, "no_model_check", False))
 
 
 def cmd_leak_check(args):
@@ -2446,6 +2608,8 @@ def main():
     d.add_argument("--input", default=None)
     d.add_argument("--topic", default="")
     d.add_argument("--refine-rounds", type=int, default=0, choices=[0, 1, 2])
+    d.add_argument("--no-model-check", action="store_true",
+                   help="跳过 OpenRouter 在线模型列表比对(离线/气隙环境,或不想发这一次 GET)")
     _add_custom_flags(d)
     lc = sub.add_parser("leak-check")
     lc.add_argument("paths", nargs="*",

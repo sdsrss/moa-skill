@@ -3,6 +3,80 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.11.0] — 2026-09-13
+
+### Upgrading — `dry-run` now makes one network call
+
+`dry-run` used to touch the network zero times. It now issues a single free, unauthenticated
+`GET https://openrouter.ai/api/v1/models` to check your model slugs. Nothing else about the run
+changed: no new spend, no new failure mode, same exit codes. (The one cosmetic difference: building
+the HTTP opener makes the pre-existing `[proxy] detected env proxy` line appear on stderr, where
+`dry-run` previously never built one.)
+
+- **What you must do**: nothing, if that call is fine in your environment.
+- **If it is not** — air-gapped, egress-filtered, or you simply do not want the call — pass
+  `--no-model-check`. That is the complete opt-out; the rest of `dry-run` is unaffected.
+- **What you will see if the call cannot complete**: one line saying the check was skipped, and the
+  dry run proceeds. A refused connection returns in milliseconds; a blackholed one burns the 5s
+  socket timeout. That 5s does **not** bound DNS: `socket.getaddrinfo` is outside urllib's timeout,
+  so a resolver that silently drops the query adds the system resolver's own timeout on top — 20s on
+  one machine whose resolver could not be reached, where the same command on 1.10.0 took 0.1s. That
+  figure is the operating system's resolver timeout, not something this code sets, so treat it as an
+  example rather than a bound. If your egress filters DNS rather than refusing connections, use
+  `--no-model-check`.
+- **Programmatic callers**: `dry_run()` itself defaults to `model_check=False`, so importing and
+  calling it never reaches the network. Only the CLI opts in.
+
+### Added
+- **`dry-run` now checks your model slugs against OpenRouter's live list.** The README has told
+  people "model IDs churn fast; verify once with `dry-run`" since the beginning, and `dry-run`
+  verified nothing — it printed whatever slug the config contained. It now fetches
+  `GET /api/v1/models` (free, and **no** `Authorization` header: the endpoint does not need a key,
+  so none is sent) and marks each **comparable** api link `OK` / `UNKNOWN` / `MISSING`. A retired or mistyped
+  slug is visible before the run starts, instead of surfacing as a 400 on one seat after the other
+  seats have already been billed.
+
+  Links it cannot honestly compare are marked `skip`, never guessed at: cli and subagent seats do
+  not use OpenRouter slugs at all, and a custom `base_url` or a non-`openrouter` `protocol` has its
+  own model namespace — judging those against OpenRouter's list would be all false alarms, which is
+  worse than not checking.
+
+  Which links those are is decided exactly the way `resolve_channel` decides it: the main link by the
+  member's own `channel`, a fallback by **the fallback's own** `channel` (absent means api), never by
+  the value a fallback inherits from its member. Getting that backwards is what v1.7.0's A1 did — it
+  judged the channel off the merged view and refused legal configs, and v1.7.1 shipped the same day to
+  undo it. Here the same mistake fails the other way: a cli seat whose fallback omits `channel` really
+  does run as an api link, and judging it off the merge would silently mark it `skip` — exactly the
+  case this feature exists for, since that link sends the member's auggie-side model name to
+  OpenRouter. The merged view is still what supplies the link's model, protocol and `base_url`.
+
+  The check is **fail-soft**: offline, blocked at the egress, endpoint moved or reshaped, it prints
+  one line and the dry run continues with its exit code unchanged — that now includes the judging
+  step, not just the fetch, so a config field of an unexpected type degrades the check instead of
+  taking down the dry run. The socket timeout is 5s (a refused connection fails in milliseconds, a
+  blackholed one burns it); DNS resolution is not covered by it. `dry-run` is the command `SKILL.md`
+  has the arbiter run in front of the user, which is why the bound matters. `--no-model-check` turns it off entirely, and the
+  `dry_run()` function defaults to *off* so that importing it never reaches the network — the
+  decision to make that GET belongs to the CLI boundary, and the test suite stays offline.
+
+### Fixed
+- **An api link with no `model` now says so.** `call_model` indexed `cfg["model"]` directly, so the
+  seat died on a `KeyError` that `_dispatch_channels` caught and reported verbatim: the user's
+  `error` field read `'model' [unknown]`, which names neither the seat's problem nor its fix, and
+  the `unknown` class polluted the error table `SKILL.md` teaches the arbiter to read. It now raises
+  the same `PermanentError` shape the cli branch uses when its binary is missing from `PATH`
+  (`err_class=startup`, with a hint), because both are the same thing: a link whose precondition is
+  absent, which cannot be attempted at all.
+
+  **No new rejection.** `validate_config` still accepts an api member without a model — that is
+  pinned by `test_validate_config_accepts_valid`, and adding the gate a reviewer proposed breaks 22
+  tests, 4 of them `accepts_*` contract tests. A single-model OpenAI-compatible gateway behind
+  `base_url` is also a legitimate reason to omit it. The link still falls through to the next
+  fallback exactly as before; only the message and the class changed. Rationale is recorded in
+  `tasks/specs/model-preflight.md` so the gate is not proposed a third time.
+
+Tests 372 → 427.
+
 ## [1.10.0] — 2026-09-13
 
 ### Upgrading — only if your `options:` block is not complete

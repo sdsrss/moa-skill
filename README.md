@@ -7,7 +7,7 @@
 Built on **Mixture-of-Agents (MoA)**: different models have different blind spots, so independent blind review plus structured aggregation beats a single model on judgment-heavy tasks. Positive gains apply to **LLM-judge–style subjective work only** — don't use it for simple Q&A or mechanically-verifiable objective problems (arithmetic, fact lookup).
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.10.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-372%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.11.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-427%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -67,7 +67,7 @@ export OPENROUTER_API_KEY=...      # recommended: one key reaches every provider
 cp skills/moa/assets/config.example.yaml config.yaml   # then edit models/channels
 ```
 
-`config.yaml` defines members (`name` / `seat` / `channel` / `model` / `fallback` / `timeout`) and `options` (`max_tokens_member` / `min_successful_members` / `grace_seconds`). The arbiter is your current agent — **it is not in the config** and makes no external calls. Model IDs churn fast; verify once with `dry-run` before a real run. The script auto-detects `http_proxy` / `https_proxy` / `no_proxy` and routes API calls through a proxy when present.
+`config.yaml` defines members (`name` / `seat` / `channel` / `model` / `fallback` / `timeout`) and `options` (`max_tokens_member` / `min_successful_members` / `grace_seconds`). The arbiter is your current agent — **it is not in the config** and makes no external calls. Model IDs churn fast, so `dry-run` checks them for you: it fetches OpenRouter's live model list (a free, unauthenticated `GET`) and marks each comparable api link `OK` / `UNKNOWN` / `MISSING`, so a retired or mistyped slug shows up before it burns the other seats' budget. Links it cannot compare — cli / subagent seats, a custom `base_url`, a non-openrouter `protocol` — are marked `skip` rather than guessed at. Which links count as api links is decided the way `resolve_channel` decides it — a fallback by its own `channel`, not by the one it inherits. The check is fail-soft — it prints one line and moves on, and that covers a bad config field as well as a bad network. The socket timeout is 5s, though DNS resolution is not bounded by it, so a silently-dropping resolver can take longer; `--no-model-check` turns the whole step off. The script auto-detects `http_proxy` / `https_proxy` / `no_proxy` and routes API calls through a proxy when present.
 
 ---
 

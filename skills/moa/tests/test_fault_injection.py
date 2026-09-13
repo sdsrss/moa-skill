@@ -1061,3 +1061,53 @@ def test_refine_uses_option_defaults_for_quorum_and_grace(monkeypatch, tmp_path)
     # 2 席: min_ok = min(2, 2) = 2, quorum_target = max(2, 1) = 2 —— 默认值改成 1 会掉到 1
     assert seen["quorum_target"] == moa.DEFAULT_OPTIONS["min_successful_members"] == 2
     assert seen["grace_s"] == moa.DEFAULT_OPTIONS["grace_seconds"]
+
+
+# ---------- M4(v1.10.0 预审, 单独立项): api 链没写 model ----------
+
+def _ok_completion(*_a, **_k):
+    return {"choices": [{"message": {"content": '{"verdict": "pass"}'}}],
+            "usage": {"total_tokens": 3}}
+
+
+def test_api_link_without_model_names_the_problem(monkeypatch):
+    """validate_config 明确放行「api 席不写 model」(test_validate_config_accepts_valid 钉住;
+    把该门加进校验会撞掉 22 条用例, 其中 4 条是契约用例), 所以修法不是加硬门, 是让报错说人话:
+    此前 call_model 的 `cfg["model"]` 裸下标抛 KeyError, 被 except Exception 接住, 用户看到的
+    error 字面是 `'model' [unknown]` —— 与"这席没写 model"零字面关联, err_class 还污染
+    SKILL.md 教仲裁人读的分类表。与 cli 分支「二进制不在 PATH → startup」对称。
+
+    显式设 key: 否则 endpoint_and_headers 会先抛 auth, 用例结果就取决于跑它的机器有没有 key
+    (本机有、CI 没有)。判据要独立于环境。"""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
+
+    def boom(*a, **k):
+        raise AssertionError("缺 model 的链不得发出任何 HTTP 请求")
+
+    monkeypatch.setattr(moa, "http_post", boom)
+    res = moa._dispatch_channels({"name": "a", "seat": "A", "channel": "api"},
+                                 "r", "s", "u", {})
+    assert res["parsed"] is None
+    assert res["err_class"] == "startup"          # 不再是 unknown
+    assert "model" in res["error"] and "'model' [unknown]" not in res["error"]
+
+
+def test_api_link_without_model_still_falls_through_to_fallback(monkeypatch):
+    """行为不变的那一半: 缺 model 的链和其它永久错误一样 continue 到下一条 fallback,
+    不占席、不吞掉后面配好的降级通道(本仓 ISSUE-006 的教训)。
+    打桩打在 http_post 而非 call_with_json_repair —— 后者会把 call_model 整个绕过去,
+    而缺 model 的判据就在 call_model 里, 那样测的是打桩本身。"""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
+    seen = []
+
+    def fake_post(url, headers, payload, timeout):
+        seen.append(payload.get("model"))
+        return _ok_completion()
+
+    monkeypatch.setattr(moa, "http_post", fake_post)
+    member = {"name": "a", "seat": "A", "channel": "api",          # 主链无 model
+              "fallback": [{"channel": "api", "model": "backup-up"}]}
+    res = moa._dispatch_channels(member, "r", "s", "u", {})
+    assert res["parsed"] == {"verdict": "pass"}
+    assert res["model_used"] == "backup-up"
+    assert seen == ["backup-up"]                  # 主链一次 HTTP 都没发

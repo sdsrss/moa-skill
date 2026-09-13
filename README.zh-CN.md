@@ -7,7 +7,7 @@
 原理基于 **Mixture-of-Agents（MoA）**：不同模型盲点不同，独立盲审 + 结构化聚合能突破单模型上限。**仅对 LLM-judge 型主观任务有正收益**——简单问答与可机械验证的客观问题（算术 / 事实检索）不要用。
 
 <p>
-<img alt="status" src="https://img.shields.io/badge/status-v1.10.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-372%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+<img alt="status" src="https://img.shields.io/badge/status-v1.11.0-brightgreen"> <img alt="tests" src="https://img.shields.io/badge/tests-427%20passing-brightgreen"> <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-blue"> <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
@@ -67,7 +67,7 @@ export OPENROUTER_API_KEY=...      # 推荐：一个 key 覆盖所有厂商
 cp skills/moa/assets/config.example.yaml config.yaml   # 首次；按需改模型 / 通道
 ```
 
-`config.yaml` 定义委员（`name` / `seat` / `channel` / `model` / `fallback` / `timeout`）与 `options`（`max_tokens_member` / `min_successful_members` / `grace_seconds`）。仲裁人 = 当前 agent，**不在配置里**，不走外部调用。模型 ID 迭代快，正式跑前用 `dry-run` 核对一次。脚本自动读取 `http_proxy` / `https_proxy` / `no_proxy`，检测到代理时 API 调用优先走代理。
+`config.yaml` 定义委员（`name` / `seat` / `channel` / `model` / `fallback` / `timeout`）与 `options`（`max_tokens_member` / `min_successful_members` / `grace_seconds`）。仲裁人 = 当前 agent，**不在配置里**，不走外部调用。模型 ID 迭代快，所以 `dry-run` 会替你核对：它拉取 OpenRouter 的在线模型列表（免费、不需要 key 的 `GET`），把每条**可比对的** api 链标成 `OK` / `UNKNOWN` / `MISSING`——已下线或拼错的 slug 会在**烧掉其余席位的钱之前**暴露。无法比对的链（cli / subagent 席、自定义 `base_url`、非 openrouter 协议）一律标 `skip`，不瞎猜。哪些算 api 链按 `resolve_channel` 的口径判——fallback 看它**自己**写的 `channel`，不是从 member 继承的那个。该步骤 fail-soft——只多打一行就继续，config 字段类型不对也一样降级、不会掀掉 dry-run。socket 超时 5s，但 **DNS 解析不受它约束**，解析器静默丢包时会更久；`--no-model-check` 整步关闭。脚本自动读取 `http_proxy` / `https_proxy` / `no_proxy`，检测到代理时 API 调用优先走代理。
 
 ---
 

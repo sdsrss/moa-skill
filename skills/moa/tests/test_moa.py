@@ -1723,7 +1723,8 @@ def test_main_announces_option_defaults_once(tmp_path, monkeypatch, capsys):
     线程里,会交错刷屏。"""
     cfg, brief = _partial_opts_config(tmp_path, "options:\n  min_successful_members: 1\n")
     monkeypatch.setattr(sys, "argv",
-                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief)])
+                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief),
+                         "--no-model-check"])
     moa.main()
     err = capsys.readouterr().err
     assert err.count("[options]") == 1                    # 一行, 不是每键一行/每席一行
@@ -1747,7 +1748,8 @@ def test_main_stays_silent_when_options_are_complete(tmp_path, monkeypatch, caps
         f"  {k}: {v}\n" for k, v in shipped["options"].items())
     cfg, brief = _partial_opts_config(tmp_path, body)
     monkeypatch.setattr(sys, "argv",
-                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief)])
+                        ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief),
+                         "--no-model-check"])
     moa.main()
     assert "[options]" not in capsys.readouterr().err
 
@@ -1768,3 +1770,340 @@ def test_default_options_track_the_shipped_example():
     # 向后兼容(v1.6.0 起的既有约定)。两个数都钉住, 任何一侧被"对齐"都会红。
     assert shipped["grace_seconds"] == 90
     assert moa.DEFAULT_OPTIONS["grace_seconds"] == 30
+
+
+# ---------- model 预检(tasks/specs/model-preflight.md): dry-run 先查再用 ----------
+
+@pytest.mark.parametrize("member,expect", [
+    # 能比对的: openrouter 协议(默认)+ 未自定义 base_url
+    ({"name": "a", "seat": "A", "channel": "api", "model": "live/one"}, ["ok"]),
+    ({"name": "a", "seat": "A", "channel": "api", "model": "retired/x"}, ["unknown"]),
+    # 不能比对的一律 skipped, 不得产生假警报
+    ({"name": "a", "seat": "A", "channel": "cli", "cli_kind": "codex"}, ["skipped"]),
+    ({"name": "a", "seat": "A", "channel": "subagent"}, ["skipped"]),
+    ({"name": "a", "seat": "A", "channel": "api", "model": "m",
+      "base_url": "http://localhost:8000/v1"}, ["skipped"]),
+    ({"name": "a", "seat": "A", "channel": "api", "model": "m",
+      "protocol": "openai"}, ["skipped"]),
+    # 缺 model: 与 call_model 的 startup 报错同源, 预检要提前说
+    ({"name": "a", "seat": "A", "channel": "api"}, ["missing"]),
+    # fallback 展开: 口径必须与 resolve_channel 的 {**member, **fb} 继承一致
+    ({"name": "a", "seat": "A", "channel": "api", "model": "live/one",
+      "fallback": [{"model": "retired/x"}]}, ["ok", "unknown"]),
+    ({"name": "a", "seat": "A", "channel": "api", "model": "live/one",
+      "fallback": [{"protocol": "openai", "model": "retired/x"}]}, ["ok", "skipped"]),
+])
+def test_check_model_slugs_classifies_each_link(member, expect):
+    live = {"live/one", "live/two"}
+    got = [st for _label, st, _detail in moa.check_model_slugs({"members": [member]}, live)]
+    assert got == expect
+
+
+def test_fetch_openrouter_models_is_fail_soft(monkeypatch):
+    """预检是可发现性工具, 不是门禁: 离线/端点变更/超时一律回 None, 由调用方降级成一行说明。"""
+    def boom(*a, **k):
+        raise OSError("no network")
+    monkeypatch.setattr(moa, "_opener_for", boom)
+    assert moa.fetch_openrouter_models(timeout=1) is None
+
+
+def test_dry_run_reports_slug_status(tmp_path, monkeypatch, capsys):
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "live/one"},
+                       {"name": "b", "seat": "B", "channel": "api", "model": "retired/x"}],
+           "options": {}}
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"live/one"})
+    moa.dry_run(cfg, "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "live/one" in out and "retired/x" in out
+    assert "unknown" in out or "不在" in out
+
+
+def test_dry_run_model_check_degrades_without_network(monkeypatch, capsys):
+    """取不到列表时只多一行说明, 不改变任何既有输出行, 也不抛。"""
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "live/one"}],
+           "options": {}}
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: None)
+    moa.dry_run(cfg, "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "确认无误后去掉 dry-run 正式运行。" in out          # 既有收尾行仍在
+    assert "跳过" in out or "skip" in out.lower()
+
+
+def test_dry_run_model_check_off_makes_no_network_call(monkeypatch, capsys):
+    """--no-model-check: 一次网络调用都不许发(离线/气隙环境的出路)。"""
+    def boom(**k):
+        raise AssertionError("关闭预检后不得取模型列表")
+    monkeypatch.setattr(moa, "fetch_openrouter_models", boom)
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "m"}], "options": {}}
+    moa.dry_run(cfg, "review", "材料", None, 1, model_check=False)
+    assert "确认无误后去掉 dry-run 正式运行。" in capsys.readouterr().out
+
+
+def test_shipped_example_api_slugs_are_all_checkable_and_named():
+    """出厂示例的每条 api 链都要能被预检覆盖(不是 skipped), 否则这个功能对默认用户等于不存在。"""
+    shipped = yaml.safe_load(
+        (Path(moa.__file__).resolve().parent.parent / "assets" / "config.example.yaml")
+        .read_text(encoding="utf-8"))
+    rows = moa.check_model_slugs(shipped, {"openai/gpt-5.6-sol", "google/gemini-3.1-pro-preview"})
+    api_rows = [r for r in rows if r[1] != "skipped"]
+    assert api_rows, "出厂示例应当至少有一条可比对的 api 链"
+    assert all(st == "ok" for _l, st, _d in api_rows), [r for r in api_rows if r[1] != "ok"]
+
+
+@pytest.mark.parametrize("member,expect", [
+    # H1(预审): fallback 省略 channel = api 链(resolve_channel:712 用 fb.get("channel","api")),
+    # 按 {**member, **fb} 的继承值去判会把它错判成 cli/subagent 而静默漏检。
+    # test_validate_config_allows_fallback_that_omits_channel 已把这条语义钉成契约。
+    ({"name": "b", "seat": "B", "channel": "cli", "cli_kind": "auggie", "model": "gpt5.6-sol",
+      "fallback": [{"protocol": "openrouter"}]}, ["skipped", "unknown"]),
+    ({"name": "b", "seat": "B", "channel": "cli", "cli_kind": "auggie",
+      "fallback": [{"model": "retired/x"}]}, ["skipped", "unknown"]),
+    ({"name": "b", "seat": "B", "channel": "subagent",
+      "fallback": [{"model": "live/one"}]}, ["skipped", "ok"]),
+    # 反方向不得误报: fallback 显式写 cli/subagent 时确实不比对
+    ({"name": "b", "seat": "B", "channel": "api", "model": "live/one",
+      "fallback": [{"channel": "cli", "cli_kind": "codex"}]}, ["ok", "skipped"]),
+])
+def test_check_model_slugs_uses_resolve_channel_semantics(member, expect):
+    live = {"live/one", "live/two"}
+    got = [st for _l, st, _d in moa.check_model_slugs({"members": [member]}, live)]
+    assert got == expect
+
+
+def test_dry_run_defaults_to_no_network():
+    """H3(预审): 「测试全离线」此前只写在 docstring 里, 没有用例钉住。默认值一旦被"统一"成 True,
+    套件在无网 CI 上照样全绿(fail-soft), 在有网 CI 上静默发出真实请求。"""
+    import inspect
+    assert inspect.signature(moa.dry_run).parameters["model_check"].default is False
+
+
+def test_cli_no_model_check_flag_actually_disables_the_fetch(tmp_path, monkeypatch):
+    """H3: --no-model-check 的接线此前零覆盖(变异里"恒开"和"恒关"都能全绿通过)。"""
+    cfg, brief = _partial_opts_config(tmp_path, "options: {}\n")
+    calls = []
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: calls.append(1) or {"m"})
+    base = ["moa.py", "dry-run", "--config", str(cfg), "--input", str(brief)]
+    monkeypatch.setattr(sys, "argv", base + ["--no-model-check"])
+    moa.main()
+    assert calls == [], "带 --no-model-check 时不得取模型列表"
+    monkeypatch.setattr(sys, "argv", base)
+    moa.main()
+    assert calls == [1], "不带该 flag 时应当恰好取一次"
+
+
+def test_fetch_openrouter_models_treats_empty_list_as_unavailable(monkeypatch):
+    """M2(预审): 端点 200 但列表为空时, 必须整体降级为"跳过", 不能把每条链刷成 UNKNOWN ——
+    那会让用户去改一份本来正确的 config。"""
+    class _Resp:
+        def read(self): return b'{"data": []}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(moa, "_opener_for", lambda url: types.SimpleNamespace(
+        open=lambda req, timeout=None: _Resp()))
+    assert moa.fetch_openrouter_models(timeout=1) is None
+
+
+def test_model_list_request_carries_no_credentials(monkeypatch):
+    """M3(预审): 「不带 Authorization」是三处加粗承诺, 但 leak-check 只做静态字面扫描,
+    抓不到"把环境变量塞进请求头"。这里是它唯一的机械门。"""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-must-not-be-sent")
+    seen = {}
+
+    class _Resp:
+        def read(self): return b'{"data": [{"id": "x/y"}]}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_opener(url):
+        def _open(req, timeout=None):
+            seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+            seen["method"], seen["data"], seen["url"] = req.get_method(), req.data, req.full_url
+            return _Resp()
+        return types.SimpleNamespace(open=_open)
+
+    monkeypatch.setattr(moa, "_opener_for", fake_opener)
+    assert moa.fetch_openrouter_models(timeout=1) == {"x/y"}
+    assert "authorization" not in seen["headers"]
+    assert not any("sk-must-not-be-sent" in str(v) for v in seen["headers"].values())
+    assert seen["method"] == "GET" and seen["data"] is None
+
+
+@pytest.mark.parametrize("model,expect_status", [
+    ("live/one", "ok"),
+    # 路由后缀不做"剥掉再比基座 id"的回落(delta D-M1 证伪了上一轮的 L1 修法:它兜不到任何真实
+    # 形态, 却把 `…:typo` 和光秃秃的尾随冒号洗成 ok)。带冒号一律 unknown, 文案里给基座 id 提示。
+    ("live/one:nitro", "unknown"),
+    ("live/one:free", "ok"),         # :free 是真实 id 形态, 走精确匹配
+    ("gone/x:nitro", "unknown"),
+    (None, "missing"),               # L2: 显式 model: null 与"没写"同判
+    ("", "missing"),
+    # delta-2 L3: 非字符串必须判 unknown 而非 missing —— 判据是运行时真实路径:
+    # `model: 123` 过得了 call_model 的 `not cfg.get("model")` 前置检查, 一路进 payload,
+    # provider 返 400(err_class=client), 不是 err_class=startup, 所以不属于"没写 model"那一格。
+    (123, "unknown"),
+    (True, "unknown"),
+    (["a", "b"], "unknown"),
+])
+def test_slug_variants_and_explicit_null(model, expect_status):
+    live = {"live/one", "live/one:free"}
+    member = {"name": "a", "seat": "A", "channel": "api", "model": model}
+    got = moa.check_model_slugs({"members": [member]}, live)
+    assert got[0][1] == expect_status
+
+
+def test_model_check_summary_line_counts_actionable_links(monkeypatch, capsys):
+    """L5(预审): 那句「↑ N 条链现在就能看出会失败」删掉后套件全绿 —— 它是用户唯一被告知
+    "该动手了"的地方, 补一条钉住。"""
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "gone/x"},
+                       {"name": "b", "seat": "B", "channel": "api"},
+                       {"name": "c", "seat": "C", "channel": "api", "model": "live/one"}],
+           "options": {}}
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"live/one"})
+    moa.dry_run(cfg, "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "2 条链" in out                      # 一条 unknown + 一条 missing, ok 的不计
+
+
+def test_model_list_timeout_stays_short():
+    """取列表的超时是写进 CHANGELOG / 两份 README / SKILL.md 的取舍值(黑洞网络下 dry-run 会走满它,
+    而 dry-run 是当着用户面跑的)。与 grace 30-vs-90 同类:文案承诺的数字要有机械门(预审 M1)。"""
+    assert moa._MODEL_LIST_TIMEOUT == 5
+    # 签名默认已改为 None(运行时取常量, 见 test_model_list_timeout_default_is_wired_to_the_constant);
+    # 这里只钉住常量的【值】, 因为它是写进 CHANGELOG / 两份 README / SKILL.md 的那个数。
+
+
+@pytest.mark.parametrize("model", [123, 3.5, True, ["gpt-5", "gpt-4"], {"a": 1}])
+def test_dry_run_survives_non_string_model(tmp_path, monkeypatch, capsys, model):
+    """delta B1(预审):`validate_config` 不校验 model 的【类型】,`model: 123` 一路放行。
+    预检里 `model in live_ids` 在 list/dict 上 unhashable 崩、`":" in model` 在 int/bool 上
+    TypeError —— 把整个 dry-run 掀掉,退出码 0→1,相对 v1.10.0 是功能回退。
+    本仓 test_dry_run_accepts_null_fields 早把「字段显式为 null 不得崩」钉成契约,
+    非字符串这半边此前没人钉。"""
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"live/one"})
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": model}],
+           "options": {}}
+    moa.dry_run(cfg, "review", "材料", None, 1, model_check=True)     # 不得抛
+    out = capsys.readouterr().out
+    assert "a(seat A)" in out
+    assert "确认无误后去掉 dry-run 正式运行。" in out                  # 后续输出未被打断
+
+
+def test_model_check_failure_never_blocks_dry_run(monkeypatch, capsys):
+    """delta B1 的结构性那一层:spec 承诺「预检绝不阻断 dry-run」,此前那个承诺只覆盖取列表
+    那一次网络调用。判定逻辑本身抛任何异常都必须降级成一行,而不是掀掉 dry-run。"""
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"live/one"})
+    monkeypatch.setattr(moa, "check_model_slugs",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    cfg = {"members": [{"name": "a", "seat": "A", "channel": "api", "model": "live/one"}],
+           "options": {}}
+    moa.dry_run(cfg, "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "判定时出错" in out and "RuntimeError" in out
+    assert "确认无误后去掉 dry-run 正式运行。" in out
+
+
+@pytest.mark.parametrize("model,expect", [
+    ("openai/gpt-5.6-sol:typo", "unknown"),   # delta D-M1: 曾被洗成 ok
+    ("openai/gpt-5.6-sol:nitro:x", "unknown"),  # 双冒号: rsplit 给 "…:nitro", split 会给 "openai/gpt-5.6-sol"
+    ("openai/gpt-5.6-sol:", "unknown"),       # 光秃秃的尾随冒号也曾被洗成 ok
+    (":lead", "unknown"),                     # 前导冒号: 基座 id 为空, 不得给出「基座 id 可能是 」空提示
+    ("openai/gpt-5.6-sol", "ok"),
+    ("live/one:free", "ok"),                  # 真实的含冒号 id 走精确匹配, 不受影响
+])
+def test_suffix_forms_are_not_washed_into_ok(model, expect):
+    """假阴性比假警报更糟:它让用户以为查过了。当天 445 条里含冒号的 96 条只有 :batch/:free
+    两种后缀且都是真实 id(精确匹配即可),那条回落兜不到任何真实形态。"""
+    live = {"openai/gpt-5.6-sol", "live/one:free"}
+    got = moa.check_model_slugs(
+        {"members": [{"name": "a", "seat": "A", "channel": "api", "model": model}]}, live)
+    assert got[0][1] == expect
+    base = model.rsplit(":", 1)[0] if ":" in model else ""
+    if expect == "unknown" and base:
+        # 删掉后缀回落之后, 这句提示是留给用户的全部补偿(delta-2 L4)
+        assert f"基座 id 可能是 {base}" in got[0][2]
+    elif ":" in model:
+        assert "基座 id 可能是" not in got[0][2]     # 空基座不给无意义提示
+
+
+def test_fallback_numbering_points_at_the_right_link():
+    """delta D-L1: 编号是用户把告警对回 config 里第几条 fallback 的唯一线索,
+    出厂 A 席有两条 fallback,差一位就指错。"""
+    member = {"name": "a", "seat": "A", "channel": "api", "model": "live/one",
+              "fallback": [{"model": "gone/1"}, {"model": "gone/2"}]}
+    labels = [lbl for lbl, _st, _d in moa.check_model_slugs({"members": [member]}, {"live/one"})]
+    assert labels == ["a(seat A)", "a(seat A) fallback#1", "a(seat A) fallback#2"]
+
+
+def test_skip_message_quotes_the_real_timeout(monkeypatch, capsys):
+    """delta D-L2: 四处 prose 里的 5s 是硬写的,只有这一行会跟着常量走;它一旦也被写死,
+    _MODEL_LIST_TIMEOUT 就彻底没有下游了。"""
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: None)
+    monkeypatch.setattr(moa, "_MODEL_LIST_TIMEOUT", 7)
+    moa.dry_run({"members": [{"name": "a", "channel": "api", "model": "m"}], "options": {}},
+                "review", "材料", None, 1, model_check=True)
+    assert "7s" in capsys.readouterr().out
+
+
+def test_model_list_timeout_default_is_wired_to_the_constant(monkeypatch):
+    """delta-2 L5: 断 `default == 5` 只钉住【值】;断 `default is _MODEL_LIST_TIMEOUT` 也不行——
+    小整数驻留让 `5 is 5` 恒真。改常量后看实际生效的超时,才是真接线。"""
+    seen = {}
+
+    class _Resp:
+        def read(self): return b'{"data": [{"id": "x/y"}]}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _open(req, timeout=None):
+        seen["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(moa, "_opener_for", lambda url: types.SimpleNamespace(open=_open))
+    monkeypatch.setattr(moa, "_MODEL_LIST_TIMEOUT", 9)
+    assert moa.fetch_openrouter_models() == {"x/y"}   # 走成功路径, 否则只证明了失败路径
+    assert seen["timeout"] == 9
+
+
+@pytest.mark.parametrize("cfg,expect_labels", [
+    ({"members": ["不是 dict", {"name": "a", "seat": "A", "channel": "api", "model": "m"}]},
+     ["a(seat A)"]),                                   # 非 dict 的 member 静默跳过
+    ({"members": [{"name": "a", "seat": "A", "channel": "api", "model": "m",
+                   "fallback": ["不是 dict", {"model": "n"}]}]},
+     ["a(seat A)", "a(seat A) fallback#2"]),           # 非 dict 的 fallback 元素静默跳过
+])
+def test_expand_links_skips_malformed_entries(cfg, expect_labels):
+    """delta-2 L6: 两条防御分支此前从未被任何用例执行过(行覆盖实测)。
+    `validate_config` 会拦掉这些形状, 但 check_model_slugs 也被直接调用, 守卫要自证。"""
+    assert [lbl for lbl, _s, _d in moa.check_model_slugs(cfg, {"m", "n"})] == expect_labels
+
+
+def test_model_check_prints_nothing_when_there_are_no_links(monkeypatch, capsys):
+    """delta-2 L6 第三条: rows 为空时直接返回, 不打空标题。"""
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"m"})
+    moa.dry_run({"members": [], "options": {}}, "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "model 预检(" not in out
+    assert "确认无误后去掉 dry-run 正式运行。" in out
+
+
+def test_render_model_check_failure_is_also_fail_soft(monkeypatch, capsys):
+    """delta-2 L2: 外壳此前只裹判定, 打印段在壳外 —— 一个不在 mark 映射里的状态就能
+    KeyError 掀掉 dry-run。今天没有 config 能走到, 但 spec 承诺的是结构性的"绝不阻断"。"""
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"m"})
+    monkeypatch.setattr(moa, "check_model_slugs", lambda *a, **k: [("lbl", "bogus-status", "d")])
+    moa.dry_run({"members": [{"name": "a", "channel": "api", "model": "m"}], "options": {}},
+                "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "判定时出错" in out and "KeyError" in out
+    assert "确认无误后去掉 dry-run 正式运行。" in out
+
+
+def test_model_check_header_states_the_comparison_scope(monkeypatch, capsys):
+    """delta-3 LOW: `live_count` 的接线没有用例 —— 标题行丢掉「对 N 个…比对」不会被发现,
+    而那是用户判断"这次比对到底覆盖了多少"的唯一依据。"""
+    monkeypatch.setattr(moa, "fetch_openrouter_models", lambda **k: {"a/1", "b/2", "c/3"})
+    moa.dry_run({"members": [{"name": "a", "seat": "A", "channel": "api", "model": "a/1"}],
+                 "options": {}}, "review", "材料", None, 1, model_check=True)
+    out = capsys.readouterr().out
+    assert "对 3 个 OpenRouter 在线模型比对" in out
