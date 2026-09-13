@@ -387,6 +387,26 @@ def test_budget_cut_prints_one_time_semantics_hint(monkeypatch, capsys):
     assert "[budget]" not in capsys.readouterr().err   # 后续调用不再重复
 
 
+def test_budget_banner_does_not_promise_a_fallback_that_does_not_exist(monkeypatch, capsys):
+    """横幅在【最后一条链】上不得说"已让位给下一条 fallback"——该席根本没有下一条。
+    用户照此去查降级链为何没生效,是在追一个不存在的现象。"""
+    monkeypatch.setattr(moa, "_budget_hint_shown", False)
+    clock = _fake_clock(monkeypatch)
+
+    def burns_full_timeout(url, headers, payload, timeout):
+        clock["t"] += timeout
+        raise TimeoutError("simulated")
+
+    monkeypatch.setattr(moa, "http_post", burns_full_timeout)
+    solo = {"name": "solo-seat", "seat": "A", "channel": "api", "model": "m1",
+            "timeout_seconds": 100}                      # 单链, 无 fallback
+    moa._dispatch_channels(solo, "r", "s", "u", {"timeout_seconds": 100, "max_tokens_member": 100})
+    err = capsys.readouterr().err
+    assert "[budget]" in err and "solo-seat" in err
+    assert "已让位给下一条 fallback" not in err           # 没有下一条可让
+    assert "timeout_seconds" in err                      # 但"怎么调回去"仍要说清
+
+
 def test_link_budget_skips_cli_repair_round_when_exhausted(monkeypatch):
     """cli 链首轮就用满预算且输出不可解析 → 不再开修复轮(那会再花一个 timeout),
     直接以 budget 类错误让位给下一条 fallback。"""

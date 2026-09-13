@@ -3,6 +3,130 @@
 All notable changes to the MoA skill. Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 this project uses semantic-ish versioning (single source: `.claude-plugin/plugin.json`, synced by `scripts/bump-version.sh`).
 
+## [1.8.0] — 2026-09-13
+
+A QA pass driven by actually running the CLI rather than reading it — seven rounds over the documented
+user paths (dry-run, generate, stats, refine, the discussion pipeline, leak-check, config handling),
+stopping after two consecutive rounds found nothing above P3, plus what three rounds of independent
+pre-ship review turned up. Eleven defects, each reproduced before it was fixed and each locked by a
+regression test. Two of them produced **wrong committee readings** rather than crashes, which is the
+failure mode this project exists to prevent.
+
+> **Three previously-accepted invocations now fail fast.** All three used to "work" only in the sense
+> of exiting 0 while producing something wrong or meaningless; none of them has a legitimate use.
+> Following the v1.7.0 precedent for ISSUE-008, no opt-out flag ships — a flag would preserve the
+> silent-failure mode being removed. To go back, pin the previous release.
+>
+> 1. **`stats` whose `--mode` disagrees with the artifacts in `--collect-dir`.** The error names the
+>    mode it detected and prints the corrected command. **Action:** pass the `--mode` you generated with.
+> 2. **`--round 0` or negative** on `refine` / `discuss-turn` / `discuss-prompt` (and negative on
+>    `stats`; `stats --round 0` stays valid and means the generate round). **Action:** number rounds
+>    from 1. For `refine` that is because round 0 *is* the generate round; for the `discuss` commands
+>    it is simply the first speaking turn, and a non-positive round used to be written into
+>    `discussion.jsonl` and shown to later speakers as "第 0 轮".
+> 3. **A member whose `seat:` is present but empty *and* which sets no explicit `role:`.** An empty
+>    seat resolved to the role key `""`, whose escaped regex matched an inline `## ` occurrence in
+>    `roles-review.md`'s own prose — so that seat silently ran with the file's documentation preamble
+>    as its role prompt. A member that sets `role:` is unaffected in `generate` / `refine`: `role`
+>    wins over `seat` in role resolution, so its seat carries no role meaning there. The `discuss`
+>    commands require a non-empty seat from every member regardless, because there `seat` is also the
+>    anonymized speaker identity and the `blindvote_<seat>.json` filename.
+>    **Action:** write `A`/`B`/`C`/`D`, or drop the key entirely to fall back to the default role.
+
+### Fixed
+- **A finished straggler no longer has its result thrown away at the grace-window boundary.**
+  `dispatch_with_quorum` harvests completed futures, *then* registers grace deadlines, *then* expires
+  them — so a seat that finished during the harvest callbacks was still in `pending` and got recorded
+  as `skipped_grace` even though its result was already in hand. Both directions were wrong: a real
+  HTTP 401 was laundered into "voluntarily skipped, not a fault", which zeroes out the
+  `members_failed - members_skipped` difference `SKILL.md` teaches the arbiter to read, and discarded
+  both the actionable hint and the already-billed `usage`; a *successful* straggler lost a paid-for
+  committee opinion outright — in the reproduction, the only seat voting `fail` with a blocker, leaving
+  `stats` reporting a unanimous `pass` with zero blockers. The expiry check now asks `fut.done()` first
+  and takes the real result when there is one. Genuinely-running seats are still skipped exactly as before.
+- **`stats` no longer emits an all-zero tally when `--mode` disagrees with the artifacts.** `--mode`
+  defaults to `review` and artifacts do not record their mode, so `generate --mode brainstorm` followed
+  by a bare `stats` silently produced `verdict_tally={'?':N}`, `mean_confidence=0.0` and zero issues —
+  and `synthesis.md` requires the arbiter to copy stats numbers into the report verbatim, so that empty
+  reading went straight into the deliverable. `stats` now infers the mode from the schema keys the
+  successful seats actually carry and refuses to aggregate under the wrong one. The detector is
+  deliberately conservative: every successful seat must point at exactly one other mode, and an
+  ambiguous or unrecognizable shape stays silent. Failed seats are skipped rather than vetoing the
+  check, so degraded runs — the common case here — are still covered.
+- **`dry-run` no longer crashes on a config written the way the example config's comment tells you
+  to.** `dict.get(k, default)` only substitutes when the key is *absent*; YAML `model:` (explicit
+  null) returns `None`, which a `:<28` width format rejects with `TypeError`. A **primary** codex
+  seat is written `model: null` — that is what `config.example.yaml`'s own comment instructs
+  ("codex 兜底: model 必须置空") — and the very first step of the documented workflow, showing the
+  user the roster and cost before spending anything, died on it. (The shipped file itself only uses
+  `model: null` inside `fallback` entries, which `dry_run` never renders, so a stock config was not
+  affected.) An explicit null in any roster column now renders as that column's empty placeholder
+  rather than raising or printing the literal `None`.
+- **One malformed field no longer destroys the whole refine-round aggregation.** ISSUE-002 hardened
+  `compute_stats` and `compute_discuss_stats` against ill-typed member fields but skipped
+  `compute_refine_stats`, where `verdict` and `revised_claimed_option` are used as dict keys and set
+  elements. A model writing either as a list or an object raised `TypeError` at three sites and threw
+  away every other seat's already-billed output. Non-string values are now excluded, and
+  `early_stop_suggested` additionally requires every successful seat to have a *readable* stance —
+  a stance nobody can read is not agreement.
+- **`compute_discuss_stats` tolerates non-string seats.** `seat` doubles as a dict key and a sort key
+  there, so mixing `seat: 1` and `seat: A` across members crashed `sorted()` on int-vs-str. Seats are
+  normalized to strings for aggregation; string seats are unaffected.
+- **The `[budget]` banner stops promising a fallback that does not exist.** It said
+  "已让位给下一条 fallback" unconditionally, including when the exhausted link was the last (or only)
+  one on the seat — sending the reader to debug a degradation chain that was never configured.
+- **A straggler whose worker raises is recorded as a failure, not as a voluntary skip.** 1.7.1
+  reached such a seat only through the expiry branch, which overwrote it with `skipped_grace` — the
+  same laundering of a fault into "not a fault" as the headline fix above, and the same corruption
+  of the `members_failed - members_skipped` difference. It is now recorded as a real failure
+  carrying the exception text. Reachable because the worker runs `resolve_channel(member)` and
+  `opts["timeout_seconds"]` *outside* `_dispatch_channels`' own `except Exception`.
+- **Non-string `seat:` and `role:` values no longer crash role resolution.** `_seat_role` hands the
+  raw value to `load_role_prompt`, which feeds it to `re.escape` — so `seat: 1`, `seat: false` or
+  `role: 123` died with a raw `TypeError` naming the `re` module, and `seat: ["A"]` died even
+  earlier on the unhashable `DEFAULT_SEAT_ROLE` lookup. Both sites now coerce to `str`, which is an
+  identity map for every string seat and role — i.e. for everything the docs, the example config and
+  `decide`-mode role injection produce — and lets an odd value fall through to the generic role
+  sentence that already exists for unknown roles. (One exotic exception: a `custom_roles` key that is
+  *not* a string, such as YAML's `1:` or `on:`, is no longer matched by an equally non-string
+  `role:`/`seat:`; such a pair now lands on the generic sentence.)
+
+### Changed
+- **Named errors replace raw tracebacks when reading a user-supplied path.** ISSUE-005 established
+  this for `--input` / `--inject`; the same doors elsewhere still raised library exceptions:
+  - hand-written CH1 artifacts (`member_*.json`, `blindvote_*.json` — the `--collect-dir` seam where
+    the *arbiter*, not the script, writes the file) gave `JSONDecodeError` without naming the file, or
+    `KeyError: 'name'`;
+  - a `config.yaml` with misaligned indentation or a tab gave the YAML scanner's error, and a
+    `--config` pointing at a directory gave `IsADirectoryError` — while the same function already
+    named the *missing*-config case;
+  - an unwritable `--collect-dir` gave `PermissionError` from `mkdir` (the *creating* commands —
+    `generate`, `discuss-turn`, `discuss-blindvote`; a write that fails later, e.g. `stats` writing
+    into a directory that is read-only but already exists, still raises);
+  - a non-UTF-8 file at any of those four doors gave `UnicodeDecodeError`. GBK-saved Chinese briefs and
+    configs are a routine Windows artifact, and `leak_check` had handled this for its own reads all
+    along. The message now names the encoding and gives the `iconv` invocation.
+- **`seat` is validated at startup.** An empty `seat` used to surface either as `TypeError` from
+  `re.escape(None)` deep inside role resolution — an error with no textual connection to the config —
+  or, for `seat: ""`, as the silent first-section match described above. Only *empty* values are
+  rejected, and only when the member sets no `role:`; `seat: 1` and a missing `seat` key still work
+  (see the coercion fix above), because tightening further would be a breaking config change for no
+  defect.
+
+**Known, not fixed here.** Two raw-traceback paths remain, both confirmed to behave identically on
+v1.7.1 and both deliberately left out to keep the repair round narrow:
+
+- `options: {}` passes `validate_config` but then raises `KeyError: 'timeout_seconds'` at dispatch,
+  because `_dispatch_channels` indexes `opts` directly while its siblings
+  (`min_successful_members`, `grace_seconds`) use `.get()` with a default. Write the `options` block
+  as `assets/config.example.yaml` does.
+- `--models` combined with a config that parses to `None` (a zero-byte `config.yaml`, or
+  `--config /dev/null`) raises `TypeError: 'NoneType' object is not iterable`, because
+  `apply_custom_committee` runs before `validate_config`. Without `--models` the same input gives the
+  named `[config] 顶层必须是 YAML 映射(dict)` error.
+
+tests 231 → 305.
+
 ## [1.7.1] — 2026-09-13
 
 Same-day patch for three regressions v1.7.0's own repairs introduced. A pre-ship reviewer's verdict

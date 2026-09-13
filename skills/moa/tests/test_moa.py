@@ -105,6 +105,34 @@ def test_compute_discuss_stats_malformed_responses_no_crash():
     assert isinstance(stats["dissent_preserved"], list)
 
 
+@pytest.mark.parametrize("seats", [
+    [1, "A"],          # config 里 seat: 1 与 seat: A 混用 → sorted() 在 str/int 间比较崩栈
+    [["A"], "B"],      # 手工编辑 jsonl 给出不可哈希 seat → last_by_seat 字典键崩
+    [None, "B"],       # seat 缺失
+])
+def test_compute_discuss_stats_odd_seat_types_no_crash(seats):
+    """seat 在讨论聚合里同时当字典键与排序键: 非字符串 seat 不得让 discuss-stats 崩栈。
+    合法配置(全字符串 seat)的结果必须与规约前一致——见下方 participants 断言。"""
+    ts = [{"round": 1, "seat": s, "role": "r",
+           "turn": {"still_holding": "x", "current_stance": "y",
+                    "responses": [], "new_argument": "n"}} for s in seats]
+    stats = moa.compute_discuss_stats(ts, [])
+    assert stats["turns_ok"] == len(seats)
+    assert all(isinstance(p, str) for p in stats["participants"])
+
+
+def test_compute_discuss_stats_string_seats_unchanged():
+    """规约不得改变合法配置的读数: 全字符串 seat 时 participants/drift 与旧行为一致。"""
+    ts = [{"round": 1, "seat": s, "role": "r",
+           "turn": {"still_holding": "x", "current_stance": s, "responses": [],
+                    "new_argument": "n"}} for s in ("B", "A")]
+    bv = [{"seat": "A", "vote": {"final_stance": "A-blind"}}]
+    stats = moa.compute_discuss_stats(ts, bv)
+    assert stats["participants"] == ["A", "B"]
+    pair = [p for p in stats["blind_vote_drift_pairs"] if p["seat"] == "A"][0]
+    assert pair["discussion_final"] == "A" and pair["blind_final"] == "A-blind"
+
+
 # ---------- 代理判定 no_proxy 边界 ----------
 
 def test_bypass_proxy_localhost():
@@ -298,6 +326,10 @@ def test_dispatch_cli_without_model_no_keyerror(monkeypatch):
     {"members": [{"name": "x"}], "options": {"max_tokens_member": 0}},         # 0 token 无效
     {"members": [{"name": "x", "timeout_seconds": "5"}], "options": {}},       # 按席 timeout 非数值
     {"members": [{"name": "x", "timeout_seconds": -5}], "options": {}},        # 按席 timeout 负值
+    # seat 写空: YAML `seat:` 即 None, 会一路漏到 load_role_prompt 的 re.escape(None) 才崩(裸 traceback)
+    {"members": [{"name": "x", "seat": None}], "options": {}},                 # YAML `seat:` (null)
+    {"members": [{"name": "x", "seat": ""}], "options": {}},                   # 空串
+    {"members": [{"name": "x", "seat": "  "}], "options": {}},                 # 全空白
 ])
 def test_validate_config_rejects_broken(cfg):
     with pytest.raises(SystemExit):
@@ -323,12 +355,248 @@ def test_read_inject_missing_file_named_error(tmp_path):
     assert "[inject]" in str(ei.value)
 
 
+# ---------- stats --mode 与产物不符: 静默给出全零共识读数 ----------
+
+def _art(name, parsed):
+    return {"name": name, "seat": "A", "role": "r", "model_used": "m", "channel_used": "api",
+            "raw": "", "parsed": parsed, "usage": None, "latency_s": 1.0,
+            "error": None, "err_class": None}
+
+
+def _stats_args(tmp_path, mode, round_no=0):
+    return types.SimpleNamespace(collect_dir=str(tmp_path), mode=mode, round=round_no)
+
+
+def test_stats_rejects_mode_mismatch(tmp_path):
+    """generate --mode brainstorm 后 stats 忘了带 --mode(默认 review)→ 旧行为静默产出
+    verdict_tally={'?':1} / mean_confidence=0.0 的全零读数。而 SKILL.md 第 4 步要求仲裁人
+    「报告中涉及数量与共识度的表述必须与 stats 一致,不得凭印象改写」——静默的错读数会被
+    照抄进最终报告。必须 fail-fast 并指出正确命令。"""
+    (tmp_path / "member_a.json").write_text(json.dumps(
+        _art("a", {"ideas": [{"title": "点子", "novelty": 5, "feasibility": 3}]})), encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_stats(_stats_args(tmp_path, "review"), None)
+    assert "--mode brainstorm" in str(ei.value)
+
+
+def test_stats_accepts_matching_mode(tmp_path, capsys):
+    (tmp_path / "member_a.json").write_text(json.dumps(
+        _art("a", {"ideas": [{"title": "点子", "novelty": 5, "feasibility": 3}]})), encoding="utf-8")
+    moa.cmd_stats(_stats_args(tmp_path, "brainstorm"), None)
+    assert '"total_ideas_before_dedup": 1' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("parsed", [
+    None,                                    # 该席失败, 无形状可判
+    {},                                      # 空对象
+    {"summary": "只写了总结"},                # 非任何 mode 的判据键
+    {"ideas": [], "verdict": "pass"},        # 两个 mode 的键同时出现 → 歧义
+])
+def test_stats_mode_check_silent_when_shape_is_ambiguous(tmp_path, parsed, capsys):
+    """防误拒(v1.7.1 A1 的教训): 形状判不出来时保持沉默照常聚合,绝不拦下合法工作流。"""
+    (tmp_path / "member_a.json").write_text(json.dumps(_art("a", parsed)), encoding="utf-8")
+    moa.cmd_stats(_stats_args(tmp_path, "review"), None)
+    assert '"members_ok"' in capsys.readouterr().out
+
+
+def test_stats_mode_check_survives_degraded_run(tmp_path):
+    """降级运行(部分席失败)在本项目里是常态。失败席没有形状可判,但不该有否决权——
+    否则这道门恰好在最该起作用的场景上失效。"""
+    (tmp_path / "member_a.json").write_text(json.dumps(
+        _art("a", {"ideas": [{"title": "点子", "novelty": 5}]})), encoding="utf-8")
+    dead = {**_art("b", None), "err_class": "server", "error": "boom"}
+    (tmp_path / "member_b.json").write_text(json.dumps(dead), encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_stats(_stats_args(tmp_path, "review"), None)
+    assert "--mode brainstorm" in str(ei.value)
+
+
+def test_stats_mode_mismatch_also_checked_on_refine_round(tmp_path):
+    """精炼轮同一陷阱: decide 精炼产物用 --mode review 聚合 → stance_tally 全零。"""
+    (tmp_path / "member_a.json").write_text(json.dumps(
+        _art("a", {"claimed_option": "PG"})), encoding="utf-8")
+    (tmp_path / "member_a.r1.json").write_text(json.dumps(
+        _art("a", {"cross_exam": [], "revised_claimed_option": "PG"})), encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_stats(_stats_args(tmp_path, "review", round_no=1), None)
+    assert "--mode decide" in str(ei.value)
+
+
+# ---------- collect-dir 接缝: CH1 席产物由仲裁人手写,坏文件要具名报错 ----------
+
+@pytest.mark.parametrize("body", [
+    '{"name":"a","parsed":{"verdict":"pass"},}',   # 尾逗号(手写最常见)
+    '{"name":"a", "parsed": ',                     # 截断写入
+    '[{"name":"a"}]',                              # 顶层不是对象
+    '{"seat":"C","parsed":{"verdict":"pass"}}',    # 漏了 name(聚合层的席位主键)
+])
+def test_load_members_named_error_on_bad_artifact(tmp_path, body):
+    """member_*.json 不全是 moa.py 写的: CH1 子代理席由仲裁人按格式手写落盘(collect-dir 接缝)。
+    手写就会有尾逗号/漏字段,旧行为是 JSONDecodeError / KeyError 冒到顶,连是哪个文件都不说。
+    对齐 ISSUE-005 给 --input/--inject 的口径: 具名 SystemExit + 指出文件。"""
+    (tmp_path / "member_a.json").write_text(body, encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        moa.load_members(tmp_path)
+    assert "[collect]" in str(ei.value) and "member_a.json" in str(ei.value)
+
+
+@pytest.mark.parametrize("body", [
+    "members:\n  - name: a\n   seat: A\n    channel: api\noptions: {}\n",   # 缩进错位
+    "members:\n\t- name: a\noptions: {}\n",                                  # tab 缩进
+    "members: [{name: a}\noptions: {}\n",                                    # 括号没闭合
+])
+def test_resolve_config_named_error_on_malformed_yaml(tmp_path, body):
+    """手改 config.yaml 的缩进/tab 是最高频的用户错误,旧行为是 yaml 库的 ScannerError 裸抛。
+    resolve_config 已经给【文件不存在】具名报错了,【文件坏了】却没有——同一道门两种待遇。"""
+    p = tmp_path / "config.yaml"
+    p.write_text(body, encoding="utf-8")
+    with pytest.raises(SystemExit) as ei:
+        moa.resolve_config(str(p))
+    assert "[config]" in str(ei.value) and str(p) in str(ei.value)
+
+
+@pytest.mark.parametrize("fname,call", [
+    ("brief.md", lambda moa_, p: moa_._read_input(str(p))),
+    ("inj.json", lambda moa_, p: moa_._read_inject(str(p))),
+    ("config.yaml", lambda moa_, p: moa_.resolve_config(str(p))),
+    ("member_a.json", lambda moa_, p: moa_.load_members(p.parent)),
+])
+def test_non_utf8_file_gives_named_error(tmp_path, fname, call):
+    """非 UTF-8 文件(Windows 下 GBK 存的中文简报 / 配置)在中文项目里很常见,旧行为是裸
+    UnicodeDecodeError。四扇读文件的门口径要一致——leak_check 的 _iter_text_files 早就
+    `except (UnicodeDecodeError, OSError)` 了,只有这几扇漏着。"""
+    p = tmp_path / fname
+    p.write_bytes("委员名: 评审甲\nmembers:\n  - name: a\n".encode("gbk"))
+    with pytest.raises(SystemExit) as ei:
+        call(moa, p)
+    assert "UTF-8" in str(ei.value)          # 报错要点名编码,而不是只说"读取失败"
+
+
+def test_resolve_config_named_error_when_path_is_a_directory(tmp_path):
+    with pytest.raises(SystemExit) as ei:
+        moa.resolve_config(str(tmp_path))
+    assert "[config]" in str(ei.value)
+
+
+@pytest.mark.skipif(not Path("/dev/null").exists(), reason="需要 POSIX 字符设备")
+def test_resolve_config_reads_non_regular_file(capsys):
+    """`--config <(…)`(进程替换 → /dev/fd/N)与 `/dev/stdin` 给的是 FIFO / 字符设备,
+    `is_file()` 为假。若按"不存在"处理,generate/dry-run 会【静默】换成出厂 4 席示例委员会并
+    真花钱,refine/discuss 则报一句"文件不存在"的假话 —— 正是 resolve_config docstring 里
+    P1-2 要防的那件事(预审 H2)。`--input` 一直用 exists(),两扇门口径也不该不一致。
+
+    用 /dev/null 而非 FIFO: 它同属"存在但非常规文件",却不需要并发写端。先前的 FIFO 版本要
+    另起线程写入,而读端在写端已关闭后再 open 会永久阻塞 —— 实测 20% 的整套运行被挂死,
+    且在修复前的代码上同样挂,危害来自测试本身(预审 B1)。测试不该比被测缺陷更危险。"""
+    assert Path("/dev/null").exists() and not Path("/dev/null").is_file()
+    cfg = moa.resolve_config("/dev/null")          # 空 YAML → None,但【不得】走示例回退
+    assert cfg is None
+    assert "using assets/config.example.yaml" not in capsys.readouterr().err
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root 绕过目录权限位,chmod 0500 拦不住 mkdir(容器 CI 常以 root 跑)")
+def test_ensure_collect_dir_named_error_when_unwritable(tmp_path):
+    """--collect-dir 落在不可写位置(路径手误 / 只读挂载)→ 旧行为裸 PermissionError。
+    每条命令都收这个参数,是最常被敲错的路径之一。"""
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        with pytest.raises(SystemExit) as ei:
+            moa._ensure_collect_dir(ro / "sub")
+        assert "[collect-dir]" in str(ei.value)
+    finally:
+        ro.chmod(0o700)
+
+
+def test_ensure_collect_dir_creates_and_is_idempotent(tmp_path):
+    d = tmp_path / "a" / "b"
+    assert moa._ensure_collect_dir(d) == d and d.is_dir()
+    assert moa._ensure_collect_dir(d) == d        # 已存在 → 不报错
+
+
+def test_discuss_stats_named_error_on_bad_blindvote(tmp_path):
+    """blindvote_*.json 同为手写可达路径(--inject 回填 CH1 盲投),坏文件同样要具名报错。"""
+    (tmp_path / "discussion.jsonl").write_text(
+        json.dumps({"round": 1, "seat": "A", "role": "r",
+                    "turn": {"current_stance": "s", "responses": [], "new_argument": ""}}) + "\n",
+        encoding="utf-8")
+    (tmp_path / "blindvote_A.json").write_text('{"seat":"A", broken', encoding="utf-8")
+    args = types.SimpleNamespace(collect_dir=str(tmp_path))
+    with pytest.raises(SystemExit) as ei:
+        moa.cmd_discuss_stats(args, None)
+    assert "[collect]" in str(ei.value) and "blindvote_A.json" in str(ei.value)
+
+
 def test_validate_config_accepts_valid_numeric_options():
     """数值选项合法值: 未设 / 正数 / min_successful_members=0 均放行(ISSUE-003)。"""
     moa.validate_config({"members": [{"name": "a", "timeout_seconds": 240},   # 按席正数
                                      {"name": "b"}],                          # 未设 = 用默认
                          "options": {"min_successful_members": 0,             # 0 = 不设下限, 合法
                                      "timeout_seconds": 180, "max_tokens_member": 3000.0}})
+
+
+def test_validate_config_accepts_nonempty_seats():
+    """seat 门只拒【空】值。非字符串 seat(如 seat: 1)放行,缺 seat 键放行(_seat_role 回落 '?')。
+    收紧成"必须是 A-D"会是配置层的破坏性变更——v1.7.1 A1 新门误拒合法配置的教训,新门宁可窄。
+    放行不等于"能跑通":角色解析侧的可跑性由 test_role_resolution_survives_nonstring_seat 独立锁住。"""
+    moa.validate_config({"members": [{"name": "a", "seat": "A"},
+                                     {"name": "b", "seat": 1},      # 非字符串: 放行
+                                     {"name": "c"}],                # 无 seat 键: 放行
+                         "options": {}})
+
+
+@pytest.mark.parametrize("member", [
+    {"name": "a", "seat": 1},              # YAML 数字 seat
+    {"name": "a", "seat": 0},              # 0 是 falsy, 另走一条分支
+    {"name": "a", "seat": False},          # bool
+    {"name": "a", "seat": ["A"]},          # 不可哈希 → DEFAULT_SEAT_ROLE 的 (mode, seat) 元组键会崩
+    {"name": "a", "seat": "A", "role": 123},   # 非字符串的显式 role: 同一崩点的另一入口
+])
+@pytest.mark.parametrize("mode", ["review", "decide", "brainstorm"])
+def test_role_resolution_survives_nonstring_seat(member, mode):
+    """校验门放行的配置必须真能跑完角色解析。
+
+    `_seat_role` 把 seat 原样当角色键,`load_role_prompt` 再喂给 `re.escape` —— 非字符串
+    就是裸 TypeError,正是 seat 门本该拦掉的那种报错,只是换了个值。校验放行却在下游崩,
+    等于把 CHANGELOG/SKILL.md 里"seat: 1 仍可跑"的承诺写成假话(预审 H1)。
+    可跑 = 落到通用兜底角色串,不是崩。"""
+    moa.validate_config({"members": [member], "options": {}})
+    txt = moa.load_role_prompt(mode, moa._seat_role(member, mode), {})
+    assert isinstance(txt, str) and txt.strip()
+
+
+@pytest.mark.parametrize("phase,fn", [
+    ("discuss-turn", "cmd_discuss_turn"),
+    ("discuss-prompt", "cmd_discuss_prompt"),
+    ("discuss-blindvote", "cmd_discuss_blindvote"),
+])
+def test_discuss_requires_nonempty_seat_even_with_explicit_role(tmp_path, phase, fn):
+    """generate/refine 放行"空 seat + 显式 role"(role 胜出,seat 不参与角色解析),但讨论里
+    seat 还是发言者身份与 blindvote 文件名:写空会落到 blindvote_None.json,再被
+    compute_discuss_stats 的 `if b.get("seat")` 当假值丢掉 —— 该席的盲投漂移静默消失,
+    而漂移检测是讨论模式的三重反从众对冲之一(预审 M3)。故非空要求只在 discuss 入口生效。"""
+    brief = tmp_path / "b.md"; brief.write_text("材料", encoding="utf-8")
+    cfg = {"members": [{"name": "alpha", "seat": "A", "role": "feasibility_skeptic"},
+                       {"name": "beta", "seat": None, "role": "security_auditor"}],
+           "options": {"max_tokens_member": 100, "timeout_seconds": 60}}
+    moa.validate_config(cfg)                     # 生成轮侧仍然合法
+    args = types.SimpleNamespace(input=str(brief), member="alpha", collect_dir=str(tmp_path),
+                                 mode="review", round=1, inject=None, blind=False, topic="")
+    with pytest.raises(SystemExit) as ei:
+        getattr(moa, fn)(args, cfg)
+    assert "非空 seat" in str(ei.value) and "beta" in str(ei.value)
+
+
+def test_validate_config_accepts_empty_seat_when_role_is_explicit():
+    """显式写了 role 的席,seat 不参与角色解析(`_seat_role` 里 role 直接胜出),v1.7.1 上
+    这种配置跑得好好的 —— 新门不得拒它(预审 M1)。decide 模式尤其常见:
+    DEFAULT_SEAT_ROLE 按设计没有 decide 条目,角色全靠 member.role / custom_roles 注入。"""
+    cfg = {"members": [{"name": "a", "seat": None, "role": "security_auditor",
+                        "channel": "api", "model": "m"}], "options": {}}
+    moa.validate_config(cfg)
+    assert moa._seat_role(cfg["members"][0], "review") == "security_auditor"
 
 
 def test_validate_config_accepts_valid():
@@ -458,6 +726,25 @@ def test_dry_run_flags_sub_first_with_billed_fallback(capsys):
            "options": {}}
     moa.dry_run(cfg, "review", "material", "", 0)
     assert "fallback 含计费通道" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("member,expect", [
+    # codex 席 model 必须置空 —— config.example.yaml 的注释就是这么教的("codex 兜底: model 必须置空")。
+    # YAML 显式 null 与「键不存在」在 dict.get(k, dflt) 里是两回事: 前者返回 None,
+    # 进 f-string 的 :<28 宽度格式即 TypeError,dry-run 在文档教的写法上直接 traceback。
+    ({"name": "a", "seat": "A", "channel": "cli", "cli_kind": "codex", "model": None}, "a    "),
+    ({"name": "a", "seat": None, "channel": "api", "model": "m"}, "?"),        # seat 写空 → 占位 ?
+    # protocol 是最后一列、无 :<宽度> 格式符, 故 None 不会抛 —— 但旧代码会把字面 "None" 印给用户。
+    # 断言渲染成占位 "-", 否则这条参数化等于什么都没测(预审 INFO)。
+    ({"name": "a", "seat": "A", "channel": "api", "model": "m", "protocol": None}, "m  "),
+])
+def test_dry_run_renders_explicit_null_fields(member, expect, capsys):
+    """dry-run 是 SKILL.md 第 2 步给用户过目的那张表: 任何字段显式为 null 都不得崩,
+    且要渲染成占位符而不是字面 "None"。"""
+    moa.dry_run({"members": [member], "options": {}}, "review", "material", "", 0)
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out and expect in out
+    assert "None" not in out          # 任何一列都不得把 None 原样印给用户
 
 
 def test_fallback_has_billed():
@@ -929,6 +1216,102 @@ def test_dispatch_member_grace_zero_skips_immediately_under_large_global():
     assert elapsed < 1.0, f"按席 0 窗未压过全局大窗 (wall={elapsed:.1f}s)"
 
 
+def _quorum_race_probe(straggler_result):
+    """构造「窗到期检查执行时,落伍席其实已经跑完」的确定性竞态。
+
+    `dispatch_with_quorum` 在同一次循环里先收割 done、再登记宽限窗、再查到期。落伍席若在
+    【收割回调执行期间】跑完,它仍留在 pending 集合里,于是到期检查把一个已完成的 future
+    当成"还在跑"处理掉。用 Event 把落伍席钉在 quorum 达成那一刻放行,窗设 0 让到期必然发生。"""
+    gate = threading.Event()
+
+    def fn(m):
+        if m["name"] == "c":
+            gate.wait(5)
+            return straggler_result
+        return {"name": m["name"], "seat": m["seat"], "role": "r", "model_used": "m",
+                "channel_used": "api", "parsed": {"verdict": "pass", "issues": []},
+                "usage": {"total_tokens": 30}, "latency_s": 0.0, "error": None, "err_class": None}
+
+    def on_done(r):
+        if r["name"] == "b":            # quorum 达成的那一刻放行 c,并等它真正跑完
+            gate.set()
+            time.sleep(0.25)
+
+    members = [{"name": n, "seat": n.upper()} for n in ("a", "b", "c")]
+    res = moa.dispatch_with_quorum(members, fn, quorum_target=2, grace_s=0, on_done=on_done)
+    return {r["name"]: r for r in res}
+
+
+def test_finished_straggler_keeps_its_real_failure_not_skipped_grace():
+    """落伍席在窗到期的同一瞬间其实已跑完 → 必须用它的【真结果】,不得记成 skipped_grace。
+
+    记错的代价是双向的: SKILL.md 教仲裁人按「真故障席 = members_failed - members_skipped」
+    读数,把一个真 401 洗成"只是慢"会让这个差算出 0 个故障;可操作的报错提示(check API key)
+    与已计费的 usage 也一并丢掉——正是 v1.7.0 想堵的漏账口。"""
+    real = {"name": "c", "seat": "C", "role": "r", "model_used": "m3", "channel_used": "api",
+            "parsed": None, "usage": {"total_tokens": 900}, "latency_s": 0.1,
+            "error": "HTTP 401 auth [auth] check API key / credits", "err_class": "auth"}
+    by = _quorum_race_probe(real)
+    assert by["c"]["err_class"] == "auth"              # 不是 skipped_grace
+    assert "401" in by["c"]["error"]
+    assert by["c"]["usage"] == {"total_tokens": 900}   # 已计费的账没丢
+    st = moa.compute_stats("review", list(by.values()))
+    assert st["members_failed"] - st["members_skipped"] == 1   # 真故障席算得出来
+
+
+def test_finished_straggler_keeps_its_successful_opinion():
+    """同一竞态的成功席变体: 丢掉的是一份【已付费】的委员意见。本例里 c 还是唯一投 fail
+    并给出 blocker 的一席——丢了它,stats 报出全票 pass、零 blocker 的假共识,
+    而"识破假共识"正是这个委员会存在的理由。"""
+    real = {"name": "c", "seat": "C", "role": "r", "model_used": "m3", "channel_used": "api",
+            "parsed": {"verdict": "fail", "confidence": 0.9,
+                       "issues": [{"title": "致命问题", "severity": "blocker"}]},
+            "usage": {"total_tokens": 1200}, "latency_s": 0.1, "error": None, "err_class": None}
+    by = _quorum_race_probe(real)
+    assert by["c"]["err_class"] is None and by["c"]["parsed"]["verdict"] == "fail"
+    st = moa.compute_stats("review", list(by.values()))
+    assert st["members_ok"] == 3
+    assert st["verdict_tally"] == {"pass": 2, "fail": 1}       # 分歧保住了
+    assert st["issue_count_by_severity"]["blocker"] == 1
+    assert st["token_usage"]["total_tokens"] == 1260           # 30+30+1200, 账齐
+
+
+def test_straggler_worker_exception_fails_only_that_seat():
+    """落伍席的 worker 自己抛异常时,`fut.result()` 会把它原样重抛,整轮 dispatch 随之炸掉,
+    且 `abandoned` 仍为 False → `shutdown(wait=True)` 还要 join 全部线程(ISSUE-009 那种挂住)。
+    该席记成失败即可,不该拖垮其余已付费的席(预审 M2)。
+
+    可达性:`_dispatch_channels` 内部 catch 了 Exception,但 worker 在它之前还跑
+    `resolve_channel(member)` 与 `opts["timeout_seconds"]` —— 而 `options: {}` 是
+    validate_config 放行的配置。"""
+    boom = RuntimeError("worker blew up")
+
+    class _Raiser(dict):
+        pass
+
+    gate = threading.Event()
+
+    def fn(m):
+        if m["name"] == "c":
+            gate.wait(5)
+            raise boom
+        return {"name": m["name"], "seat": m["seat"], "role": "r", "model_used": "m",
+                "channel_used": "api", "parsed": {"verdict": "pass", "issues": []},
+                "usage": {"total_tokens": 30}, "latency_s": 0.0, "error": None, "err_class": None}
+
+    def on_done(r):
+        if r["name"] == "b":
+            gate.set()
+            time.sleep(0.25)
+
+    members = [{"name": n, "seat": n.upper()} for n in ("a", "b", "c")]
+    res = moa.dispatch_with_quorum(members, fn, quorum_target=2, grace_s=0, on_done=on_done)
+    by = {r["name"]: r for r in res}
+    assert set(by) == {"a", "b", "c"}                 # 其余两席的结果没被连累
+    assert by["c"]["parsed"] is None
+    assert "worker blew up" in by["c"]["error"]
+
+
 # ---------- ISSUE-009: 弃席后进程快速退出(不等 atexit join 落伍线程)----------
 
 def test_abandoning_straggler_sets_fast_exit_flag(monkeypatch):
@@ -1049,6 +1432,43 @@ def test_main_refine_forbids_example_fallback(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as ei:
         moa.main()
     assert "禁止回退" in str(ei.value)
+
+
+# ---------- --round 取值门: 轮次是编排计数器, 0/负数不是合法轮次 ----------
+
+@pytest.mark.parametrize("phase,bad", [
+    ("refine", "0"),          # 0 就是生成轮本身, 不存在"精炼到第 0 轮"
+    ("refine", "-1"),
+    ("discuss-turn", "0"),    # 旧行为: 静默写进 transcript, 后发言者读到「第 0 轮」
+    ("discuss-turn", "-1"),
+    ("discuss-prompt", "0"),
+    ("stats", "-1"),          # stats 允许 0(读生成轮产物), 但不允许负数
+    ("refine", "abc"),        # 非整数
+])
+def test_main_rejects_out_of_range_round(tmp_path, monkeypatch, phase, bad):
+    brief = tmp_path / "b.md"; brief.write_text("x", encoding="utf-8")
+    argv = ["moa.py", phase, "--collect-dir", str(tmp_path), "--round", bad]
+    if phase != "stats":
+        argv += ["--input", str(brief)]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as ei:
+        moa.main()
+    assert ei.value.code == 2          # argparse 的用法错误退出码
+
+
+@pytest.mark.parametrize("phase,good", [("refine", "1"), ("discuss-turn", "1"),
+                                        ("stats", "0"), ("stats", "2")])
+def test_main_accepts_valid_round(tmp_path, monkeypatch, phase, good):
+    """防误拒: 合法轮次必须照常放行(门只拦 0/负数/非整数)。"""
+    brief = tmp_path / "b.md"; brief.write_text("x", encoding="utf-8")
+    argv = ["moa.py", phase, "--collect-dir", str(tmp_path), "--round", good]
+    if phase != "stats":
+        argv += ["--input", str(brief)]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as ei:
+        moa.main()                     # 后续必然因缺产物/缺 config 退出, 但不是 argparse 的 code 2
+    assert ei.value.code != 2
 
 
 # ---------- min_successful 动态阈值(逻辑) ----------
@@ -1185,6 +1605,45 @@ def test_refine_stats_decide_cross_exam():
     assert s["cross_exam_by_severity"]["minor"] == 1
     assert s["option_shifts"] == 1
     assert s["early_stop_suggested"] is True    # 两席最终都投 PG
+
+
+# ---------- ISSUE-002 补全: 精炼统计的标量字段同样要类型守卫 ----------
+# compute_stats / compute_discuss_stats 当初都补了守卫(见上方 malformed 用例),
+# compute_refine_stats 被漏掉: verdict / revised_claimed_option 在这里既当 dict 键
+# 又当 set 元素,模型把它写成 list/dict 就整轮聚合崩栈 —— 其余席已付费的产物一并作废。
+
+@pytest.mark.parametrize("prior_v,cur_v", [
+    (["pass"], "pass"),          # 上一轮畸形 → _majority_verdict 的 tally[v]
+    ("pass", ["pass"]),          # 本轮畸形 → cur_verdicts 集合
+    ({"v": "pass"}, "pass"),     # dict 同样不可哈希
+])
+def test_refine_stats_review_unhashable_verdict_no_crash(prior_v, cur_v):
+    prior = [_rf("a", prior_v, []), _rf("b", "pass", [])]
+    refine = [_rf("a", cur_v, []), _rf("b", "pass", [])]
+    s = moa.compute_refine_stats("review", prior, refine)
+    assert s["round_members_ok"] == 2          # 两席 parsed 都是对象 → 仍算成功席
+    assert isinstance(s["stance_tally"], dict)
+
+
+def test_refine_stats_no_early_stop_when_verdict_unreadable():
+    """不可读的 verdict 不等于"和别人一致": 有席立场读不出来时不得建议早停
+    (否则仲裁人会据此少跑一轮,而那一轮正是要补上这席立场的)。"""
+    prior = [_rf("a", "pass", []), _rf("b", "pass", [])]
+    refine = [_rf("a", "pass", []), _rf("b", ["pass"], [])]
+    s = moa.compute_refine_stats("review", prior, refine)
+    assert s["early_stop_suggested"] is False
+
+
+def test_refine_stats_decide_unhashable_option_no_crash():
+    prior = [{"name": "a", "seat": "A", "parsed": {"claimed_option": "PG"}},
+             {"name": "b", "seat": "C", "parsed": {"claimed_option": "Mongo"}}]
+    refine = [{"name": "a", "seat": "A",
+               "parsed": {"revised_claimed_option": {"opt": "PG"}, "cross_exam": []}},
+              {"name": "b", "seat": "C",
+               "parsed": {"revised_claimed_option": "PG", "cross_exam": []}}]
+    s = moa.compute_refine_stats("decide", prior, refine)
+    assert s["round_members_ok"] == 2
+    assert s["early_stop_suggested"] is False   # 一席认领选项不可读 → 不构成全一致
 
 
 # ---------- 产物读写 round-trip + 精炼产物排除 ----------

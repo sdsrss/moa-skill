@@ -155,6 +155,11 @@ def load_role_prompt(mode: str, role_key: str, custom_roles: dict) -> str:
     """解析顺序(design.md §4.1): custom_roles > 场景 roles-*.md 段落 > seat 默认。
     references/*.md 用 '## <role_key>' 分段;文件缺失或角色未定义时返回一句兜底,
     保证 M1 在 references 尚未定稿时仍可跑通(骨架优先)。"""
+    # role_key 可能不是字符串: seat 由 YAML 写出(`seat: 1` / `seat: false`),member.role 同理,
+    # 而下面的 re.escape 只吃 str/bytes —— 否则是一句与配置毫无字面关联的裸 TypeError
+    # (正是 seat 门要消灭的那种报错,只是换了个值)。规约后非法 seat 落到通用兜底角色串,
+    # 与"references 里没有这个角色段落"同一条路,不崩(预审 H1)。
+    role_key = role_key if isinstance(role_key, str) else str(role_key)
     if role_key in custom_roles:
         return custom_roles[role_key].strip()
     md = REFS / ROLE_FILES.get(mode, "roles-review.md")
@@ -577,6 +582,11 @@ def _fallback_has_billed(member) -> bool:
 
 def _seat_role(member, mode):
     seat = member.get("seat", "?")
+    if not isinstance(seat, str):
+        # DEFAULT_SEAT_ROLE 按 (mode, seat) 元组取值,不可哈希的 seat(`seat: ["A"]`)会在这里
+        # 就崩成 `unhashable type: 'list'`,连 load_role_prompt 的规约都够不着。合法配置全是
+        # 字符串 seat,规约对它们是恒等映射(预审 H1)。
+        seat = str(seat)
     return member.get("role") or DEFAULT_SEAT_ROLE.get((mode, seat)) or seat
 
 
@@ -592,7 +602,7 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
     timeout = member.get("timeout_seconds", opts["timeout_seconds"])
     t0 = time.time()
     last = None
-    for kind, ccfg, note in tries:
+    for idx, (kind, ccfg, note) in enumerate(tries):
         # 每条 fallback 链各自一份挂钟预算(修 ISSUE-007): timeout_seconds 的语义从「每次 HTTP
         # 尝试」收紧为「这条链的总挂钟」,覆盖它的重试与 JSON 修复轮。单席上界因此收敛到
         # 展开后链数 × timeout(此前是 链数 × (1+retries) × timeout,默认阵容 A 席最坏 36 分钟;
@@ -655,7 +665,7 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
         except Exception as e:
             ec = getattr(e, "err_class", "unknown")
             if ec == "budget":
-                _warn_budget_semantics_once(member, timeout)
+                _warn_budget_semantics_once(member, timeout, has_next_link=idx + 1 < len(tries))
             # usage/raw 可能由 call_with_json_repair 挂在异常上(预审评审 #1): 生成轮已计费、
             # 修复轮抛错时, 账与原始输出都在这里取回, 不随栈帧丢掉。
             last = _fail(member, role_key, f"{e} [{ec}]", ec, t0,
@@ -668,7 +678,7 @@ def _dispatch_channels(member, role_key, system, user, opts, default_temp=0.3):
 _budget_hint_shown = False
 
 
-def _warn_budget_semantics_once(member, timeout):
+def _warn_budget_semantics_once(member, timeout, has_next_link=True):
     """链预算首次真的砍掉一条通道时,到 stderr 说明一次语义变更(v1.7.0 可发现性信号)。
 
     ISSUE-007 改的是既有旋钮的含义,是【静默】的用户可见行为变更: 升级前某席靠重试熬到第 2、3 次
@@ -678,9 +688,14 @@ def _warn_budget_semantics_once(member, timeout):
     if _budget_hint_shown:
         return
     _budget_hint_shown = True
+    # 被砍的若是链上【最后一条】(或该席本来就只有一条), 就没有"下一条 fallback"可让——
+    # 照说不误会让用户去排查一条不存在的降级链。此时该席已确定失败, 出路是调大 timeout
+    # 或给它配 fallback, 直接说出来。
+    handoff = ("已让位给下一条 fallback。" if has_next_link else
+               "该席已无更多 fallback 可试,本席就此判失败。")
     print(f"[budget] v1.7.0 起 timeout_seconds 是【每条 fallback 链】的挂钟预算(含该链的重试与 "
           f"JSON 修复轮),不再是每次 HTTP 尝试。{member['name']} 的一条链用满 {timeout}s 被中止,"
-          f"已让位给下一条 fallback。要给这条链更多重试余量就调大该席的 timeout_seconds;"
+          f"{handoff}要给这条链更多重试余量就调大该席的 timeout_seconds;"
           f"单席最坏耗时 = 展开后的链数 × timeout_seconds。", file=sys.stderr)
 
 
@@ -949,15 +964,35 @@ def dispatch_with_quorum(members, fn, quorum_target, grace_s, on_done=None):
                 now = time.monotonic()
                 for fut in [f for f in pending if f in deadlines and now >= deadlines[f]]:
                     m = futs[fut]
-                    r = _skipped_grace(m)
+                    if fut.done() and not fut.cancelled() and fut.exception() is not None:
+                        # worker 自己炸了(不是返回失败结果): 直接 fut.result() 会把它重抛,
+                        # 整轮 dispatch 随之炸掉, 且 abandoned 仍为 False → shutdown(wait=True)
+                        # 还要 join 全部线程, 正是 ISSUE-009 那种挂住(预审 M2)。记成该席失败,
+                        # 不连累其余已付费的席。可达性: _dispatch_channels 内部虽 catch 了
+                        # Exception, worker 在它之前还跑 resolve_channel 与 opts["timeout_seconds"],
+                        # 而 `options: {}` 是 validate_config 放行的配置。
+                        r = _fail(m, m.get("role", "?"),
+                                  f"straggler worker raised: {fut.exception()}", "unknown")
+                    elif fut.done():
+                        # 它在【本次循环的收割回调执行期间】跑完了, 只是还留在 pending 里。
+                        # 此时把它记成 skipped_grace 是双向的错: 成功席会丢掉一份已付费的委员
+                        # 意见(若它恰是唯一的异议席, stats 就报出全票通过的假共识); 失败席则把
+                        # 真故障(如 401)洗成"主动放弃", 而 SKILL.md 教仲裁人按
+                        # 「真故障席 = members_failed - members_skipped」读数, 这个差会算成 0,
+                        # 连同可操作的报错提示与已计费的 usage 一起丢。结果已经在手, 直接用。
+                        r = fut.result()
+                        if r.get("parsed"):
+                            ok += 1
+                    else:
+                        r = _skipped_grace(m)
+                        fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
+                        abandoned = True
+                        global _ABANDONED_STRAGGLERS  # 供 main() 干净路径上的快速退出(修 ISSUE-009)
+                        _ABANDONED_STRAGGLERS = True
                     results[m["name"]] = r
                     if on_done:
                         on_done(r)
-                    fut.cancel()  # 尚未起跑的能真取消; 已在跑的由 member 级 timeout 自行了结
                     pending.discard(fut)
-                    abandoned = True
-                    global _ABANDONED_STRAGGLERS   # 供 main() 干净路径上的快速退出(修 ISSUE-009)
-                    _ABANDONED_STRAGGLERS = True
     finally:
         # abandoned=True → wait=False 立即交还控制权(不 join 落伍线程); 正常完成 → wait=True。
         ex.shutdown(wait=not abandoned)
@@ -989,6 +1024,38 @@ def write_member(collect_dir: Path, res: dict, round_no: int = 0):
     return p
 
 
+def _read_artifact(p: Path, require_name: bool = True) -> dict:
+    """读一份 collect-dir 产物,坏文件给具名报错而非裸 traceback。
+
+    这条路上的文件【不全是 moa.py 写的】: CH1 子代理席由仲裁人按 member_<name>.json 的格式
+    手写落盘(SKILL.md 第 3 步 / CLAUDE.md 的 collect-dir 接缝),`--inject` 回填的盲投同理。
+    手写就会有尾逗号、截断、漏字段。旧行为是 json 模块的 JSONDecodeError 或聚合层的
+    KeyError 冒到顶,连是【哪个文件】都不说,而这一步往往已经花掉了全部委员 token。
+    对齐 ISSUE-005 给 --input/--inject 的口径: 指名文件、指名缺什么、说清怎么修。
+
+    require_name: member 产物的 name 是聚合层的席位主键(stats roster / 精炼轮按 name 对账
+    上一轮 / anonymize_others 按 name 排除己见),缺了必崩,故在门口要求;blindvote 产物按
+    seat 聚合、不读 name,放行。"""
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        sys.exit(f"[collect] 产物{_ENC_HINT} 路径: {p}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"[collect] 产物不是合法 JSON: {p} ({e})。"
+                 f"CH1 席产物由仲裁人手写时尤易出错(尾逗号 / 未转义引号 / 写了一半),"
+                 f"修好该文件再重跑;不想要这一席就直接删掉该文件。")
+    except OSError as e:
+        sys.exit(f"[collect] 读取产物失败: {p} ({e})")
+    if not isinstance(obj, dict):
+        sys.exit(f"[collect] 产物顶层必须是 JSON 对象: {p}(收到 {type(obj).__name__})。"
+                 f"参照同目录下 moa.py 自己写出的 member_*.json 的形状。")
+    if require_name and not obj.get("name"):
+        sys.exit(f"[collect] 产物缺 name 字段: {p}——name 是聚合层的席位主键"
+                 f"(stats 的 roster、精炼轮按 name 对账上一轮意见),缺了该席会静默消失。"
+                 f"补上 \"name\": \"<席位名>\" 再重跑。")
+    return obj
+
+
 def load_members(collect_dir: Path, round_no: int = 0):
     suffix = f".r{round_no}" if round_no else ""
     out = []
@@ -996,7 +1063,7 @@ def load_members(collect_dir: Path, round_no: int = 0):
         # 精炼产物命名含 .rN,round_no=0 时须排除它们
         if round_no == 0 and re.search(r"\.r\d+\.json$", p.name):
             continue
-        out.append(json.loads(p.read_text(encoding="utf-8")))
+        out.append(_read_artifact(p))
     return out
 
 
@@ -1057,6 +1124,43 @@ def _str(v) -> str:
     """把该是字符串的字段收敛成 str(修 ISSUE-002): 模型偶尔把它写成 list/数字/null,
     非字符串一律记空串,供 .strip()/拼接安全使用。"""
     return v if isinstance(v, str) else ""
+
+
+# 各 mode 产物的判据键(schema 里该 mode 独有、其余 mode 不产出的字段)。
+# 生成轮与精炼轮 schema 不同,分两张表。
+_MODE_SHAPE = {
+    0: {"review": ("verdict", "issues"),
+        "decide": ("claimed_option", "strongest_case", "opponent_fatal_flaws"),
+        "brainstorm": ("ideas",)},
+    1: {"review": ("verdicts_on_others", "revised_issues"),
+        "decide": ("cross_exam", "concessions", "revised_claimed_option")},
+}
+
+
+def _detect_mode(results: list, round_no: int = 0):
+    """按成功席 parsed 的键形反推这批产物是哪个 mode 生成的;判不出来返回 None。
+
+    为什么需要: `stats` 的 --mode 有默认值(review),而产物里不记 mode。跑完
+    `generate --mode brainstorm` 再敲一句不带 --mode 的 stats,就会拿 review 的分支去聚合
+    头脑风暴产物——不报错,只是 verdict_tally={'?':N}、mean_confidence=0.0、问题数全零。
+    偏偏 SKILL.md 第 4 步要求仲裁人「报告中涉及数量与共识度的表述必须与 stats 一致,不得凭
+    印象改写」,于是这份静默的错读数会被原样抄进最终报告。
+
+    判据保守(防误拒,v1.7.1 A1 的教训): 必须【全部成功席】都只命中同一个 mode 才下结论。
+    空 parsed、命中多个 mode 或一个都不命中 → 返回 None 保持沉默,照常聚合。
+    失败席【跳过而非否决】: 本项目里降级运行(degraded)是常态,若一有失败席就整体沉默,
+    这道门恰好在最该起作用的场景上失效。失败席本就没有形状可判,不该有否决权。"""
+    table = _MODE_SHAPE.get(1 if round_no else 0, {})
+    ok = [r for r in results if _parsed_ok(r)]
+    if not ok:
+        return None                         # 全军覆没: 无形状可判
+    votes = set()
+    for r in ok:
+        hit = {mode for mode, keys in table.items() if any(k in r["parsed"] for k in keys)}
+        if len(hit) != 1:
+            return None                     # 歧义(同时像两个 mode)或一个都不像
+        votes |= hit
+    return votes.pop() if len(votes) == 1 else None
 
 
 def compute_stats(mode: str, results: list) -> dict:
@@ -1144,7 +1248,10 @@ def _majority_verdict(results, field):
     for r in results:
         if _parsed_ok(r):
             v = r["parsed"].get(field)
-            if v is not None:
+            # 只计字符串(补全 ISSUE-002): verdict 是字符串枚举, 模型偶尔把它写成 list/dict,
+            # 那既不是合法 verdict 也【不可哈希】——直接进 tally[v] 会 TypeError 崩掉整轮聚合,
+            # 连带作废其余席已付费的产物。非字符串按"该席没给出可读立场"处理, 不进计票。
+            if isinstance(v, str):
                 tally[v] = tally.get(v, 0) + 1
     if not tally:
         return None
@@ -1199,9 +1306,14 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
         sycophancy_alert = movers > 0 and (flips_toward_majority / movers) > 0.5
         # 早停信号: 本轮 verdict 全一致 且 无 disputed 且 无席位失败(修 F3)——
         # 有席位本轮失败则证据不全,失败席立场缺席,"全一致"可能是幸存者偏差,不建议早停。
-        cur_verdicts = {r["parsed"].get("verdict") for r in ok}
-        early_stop = (len(cur_verdicts) == 1 and not challenged_titles
-                      and base["round_members_failed"] == 0)
+        # 同 _majority_verdict: 非字符串 verdict 不可哈希, 进 set 就崩。剔除后还要求
+        # 【可读席数 == 成功席数】——立场读不出来的席不等于"和别人一致", 有这种席就不建议早停,
+        # 否则仲裁人据此少跑一轮, 而那一轮正是要补上这席立场的。
+        readable = [r["parsed"].get("verdict") for r in ok
+                    if isinstance(r["parsed"].get("verdict"), str)]
+        cur_verdicts = set(readable)
+        early_stop = (len(cur_verdicts) == 1 and len(readable) == len(ok)
+                      and not challenged_titles and base["round_members_failed"] == 0)
         base.update(
             stance_tally=stance,
             disputed_titles=sorted(challenged_titles),       # 一票 challenge 即锁 disputed
@@ -1221,11 +1333,22 @@ def compute_refine_stats(mode: str, prior_results: list, refine_results: list) -
             pj = prior_by.get(r["name"])
             if pj and pj["parsed"].get("claimed_option") != r["parsed"].get("revised_claimed_option"):
                 shifts += 1
-        cur_opts = {r["parsed"].get("revised_claimed_option") for r in ok}
+        readable_opts = [r["parsed"].get("revised_claimed_option") for r in ok
+                         if isinstance(r["parsed"].get("revised_claimed_option"), str)]
+        cur_opts = set(readable_opts)        # 同 review 分支: 非字符串不可哈希, 且不算"一致"
         base.update(cross_exam_by_severity=exam, option_shifts=shifts,
                     early_stop_suggested=(len(cur_opts) == 1     # 修 F3: 同 review,有失败席不早停
+                                          and len(readable_opts) == len(ok)
                                           and base["round_members_failed"] == 0))
     return base
+
+
+def _seat_key(v) -> str:
+    """seat 在讨论聚合里同时当【字典键】与【排序键】,故必须先规约成字符串(补全 ISSUE-002):
+    config 里 `seat: 1` 与 `seat: A` 混用会让 sorted() 在 int/str 之间比较崩栈,手工编辑过的
+    discussion.jsonl 还可能给出 list 这种不可哈希值。对合法配置(全字符串 seat)是恒等映射,
+    读数不变;落盘文件名早已是 _safe_name(str(seat)),这里只是把同一口径补到聚合层。"""
+    return v if isinstance(v, str) else ("?" if v is None else str(v))
 
 
 def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
@@ -1238,7 +1361,7 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
     for t in ok:
         p = t["turn"]
         if p.get("position_changed") and not p.get("changed_by_new_argument"):
-            conformity.append({"seat": t.get("seat"), "role": t.get("role"),
+            conformity.append({"seat": _seat_key(t.get("seat")), "role": t.get("role"),
                                "round": t.get("round"), "current_stance": p.get("current_stance")})
     # 假讨论: 整轮所有发言 new_argument 皆空(无信息增量)
     pseudo_rounds = []
@@ -1249,8 +1372,9 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
     # 盲投漂移对照: 只给出(讨论终态 vs 盲投终态)配对,语义是否漂移交仲裁人判(不假装机械判等)
     last_by_seat = {}
     for t in ok:
-        last_by_seat[t.get("seat")] = t   # rounds 升序遍历,末次覆盖
-    bv_by_seat = {b.get("seat"): b for b in (blindvotes or []) if b.get("seat")}
+        last_by_seat[_seat_key(t.get("seat"))] = t   # rounds 升序遍历,末次覆盖
+    bv_by_seat = {_seat_key(b.get("seat")): b
+                  for b in (blindvotes or []) if b.get("seat")}
     drift_pairs = []
     for seat, t in last_by_seat.items():
         bv = bv_by_seat.get(seat)
@@ -1273,7 +1397,7 @@ def compute_discuss_stats(transcript: list, blindvotes: list) -> dict:
         "rounds": len(rounds),
         "turns_ok": len(ok),
         "turns_failed": len([t for t in transcript if not isinstance(t.get("turn"), dict)]),
-        "participants": sorted({t.get("seat") for t in ok}),
+        "participants": sorted({_seat_key(t.get("seat")) for t in ok}),
         "conformity_alerts": conformity,
         "conformity_alert": len(conformity) > 0,
         "pseudo_discussion_rounds": pseudo_rounds,
@@ -1393,6 +1517,14 @@ def leak_check(paths) -> list:
 
 # ---------- dry-run 预演 ----------
 
+def _cell(v, dflt=""):
+    """dry-run 表格单元格取值。`dict.get(k, dflt)` 的默认值只在【键不存在】时生效,YAML 写
+    `model:`(显式 null)时返回的是 None,进 f-string 的 `:<28` 宽度格式就 TypeError——而
+    `model: null` 正是 codex 席的出厂推荐写法(config.example.yaml 的 fallback 与注释),
+    于是 dry-run 恰好在文档教的配置上裸 traceback,卡死 SKILL.md 第 2 步「给用户过目」。"""
+    return dflt if v is None else str(v)
+
+
 def dry_run(cfg, mode, material, topic, refine_rounds):
     members = cfg["members"]
     n = len(members)
@@ -1412,7 +1544,8 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
             flag = "  ⚠ fallback 含计费通道,降级时转计费"
         else:
             flag = ""
-        print(f"{m['name']:<18}{m.get('seat','?'):<6}{ch:<10}{m.get('model',''):<28}{m.get('protocol','-')}{flag}")
+        print(f"{_cell(m.get('name')):<18}{_cell(m.get('seat'), '?'):<6}{ch:<10}"
+              f"{_cell(m.get('model')):<28}{_cell(m.get('protocol'), '-')}{flag}")
         if bill == "sub":
             api_calls_sub += 1
         else:
@@ -1432,6 +1565,10 @@ def dry_run(cfg, mode, material, topic, refine_rounds):
 
 # ---------- 主流程 ----------
 
+_ENC_HINT = ("文件不是 UTF-8 编码。本项目一律按 UTF-8 读写(Windows 记事本另存为 GBK 是最常见来源);"
+             "用 `iconv -f gbk -t utf-8 <文件> -o <文件>.utf8` 或编辑器「以 UTF-8 重新保存」后重试。")
+
+
 def _read_input(path: str) -> str:
     """读 --input 简报文本;不存在/不可读时给具名 `[input]` 报错而非裸 FileNotFoundError
     traceback(修 ISSUE-005)——对齐 resolve_config 的 config-缺失体验。最常用的参数不该最糙。"""
@@ -1440,6 +1577,8 @@ def _read_input(path: str) -> str:
         sys.exit(f"[input] 简报文件不存在: {path}(检查 --input 路径,或先按 briefing.md 写 brief.md)")
     try:
         return p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        sys.exit(f"[input] 简报{_ENC_HINT} 路径: {path}")
     except OSError as e:
         sys.exit(f"[input] 读取简报失败: {path} ({e})")
 
@@ -1451,8 +1590,42 @@ def _read_inject(path: str):
         sys.exit(f"[inject] 注入文件不存在: {path}(检查 --inject 路径)")
     try:
         return parse_json(p.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        sys.exit(f"[inject] 注入{_ENC_HINT} 路径: {path}")
     except OSError as e:
         sys.exit(f"[inject] 读取注入文件失败: {path} ({e})")
+
+
+def _ensure_collect_dir(path) -> Path:
+    """建 --collect-dir 并给具名报错。每条命令都收这个参数,是最常被敲错的路径之一
+    (路径手误 / 只读挂载 / 父目录不存在且无权限),旧行为是 mkdir 的裸 PermissionError。
+    对齐 ISSUE-005 给 --input/--inject 的口径。"""
+    p = Path(path)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"[collect-dir] 无法创建产物目录: {p} ({e})。"
+                 f"检查 --collect-dir 路径与写权限;产物目录需可写(逐委员 JSON 与 stats 都落在这里)。")
+    return p
+
+
+def _load_yaml(p: Path, label: str):
+    """读一份 YAML 配置,坏文件给具名报错。resolve_config 早就给【文件不存在】具名报错了,
+    【文件存在但写坏了】却一路裸抛 yaml.YAMLError / IsADirectoryError——同一道门两种待遇,
+    而手改 config.yaml 的缩进或 tab 恰恰是最高频的用户错误。"""
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        sys.exit(f"[config] {label}{_ENC_HINT} 路径: {p}")
+    except OSError as e:
+        sys.exit(f"[config] 读取{label}失败: {p} ({e})。"
+                 f"确认 --config 指向的是一个可读的 YAML 文件(不是目录)。")
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        sys.exit(f"[config] {label} YAML 解析失败: {p}\n        {e}\n"
+                 f"        常见原因: 缩进对不齐、用了 tab(YAML 只认空格)、引号/括号没闭合。"
+                 f"参照 assets/config.example.yaml 的缩进。")
 
 
 def resolve_config(path_arg, allow_example_fallback=True):
@@ -1461,15 +1634,21 @@ def resolve_config(path_arg, allow_example_fallback=True):
     refine/discuss-* 禁止回退(allow_example_fallback=False)——其语义依赖与生成轮【同一份】
     config,静默换成示例委员会会写出错席位产物、污染 stats(修 P1-2,mem #10096)。"""
     p = Path(path_arg) if path_arg else Path("config.yaml")
+    if p.is_dir():
+        sys.exit(f"[config] --config 指向的是目录而非文件: {p}。给出 config.yaml 的完整路径。")
+    # 这里必须是 exists() 而非 is_file(): `--config <(…)`(进程替换 → /dev/fd/N)与 /dev/stdin
+    # 是 FIFO / 字符设备,is_file() 为假。把它们当"不存在",generate/dry-run 会【静默】换成出厂
+    # 示例委员会并真花钱落盘,refine/discuss 则报一句"文件不存在"的假话 —— 正是本函数 docstring
+    # 里 P1-2 要防的事(预审 H2)。`_read_input` 一直用 exists(),两扇门口径也该一致。
     if p.exists():
-        return yaml.safe_load(p.read_text(encoding="utf-8"))
+        return _load_yaml(p, "配置")
     if not allow_example_fallback:
         sys.exit(f"[config] {p} 不存在,且此阶段(refine/discuss)禁止回退到示例配置——"
                  f"请用 --config 指定与 generate 同一份 config.yaml,否则会用错委员会污染产物。")
     example = SKILL_ROOT / "assets" / "config.example.yaml"
     if example.exists():
         print(f"[hint] {p} not found, using assets/config.example.yaml", file=sys.stderr)
-        return yaml.safe_load(example.read_text(encoding="utf-8"))
+        return _load_yaml(example, "示例配置")
     sys.exit(f"config not found: {p}. Copy assets/config.example.yaml to config.yaml and edit.")
 
 
@@ -1509,6 +1688,21 @@ def validate_config(cfg):
         ch = m.get("channel", "api")
         if ch not in ("api", "cli", "subagent"):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) channel={ch!r} 非法(应为 api/cli/subagent)")
+        # seat 写空(YAML `seat:` 即 None,或空串)不会在这里报错,而是一路漏到
+        # load_role_prompt 的 re.escape(None) 才崩成裸 traceback——用户看到的是正则库的
+        # 报错,与配置毫无字面关联。按 ISSUE-005 的口径在入口具名拦下。
+        # 只拒【空】值: seat: 1 这类非字符串写法当前可跑(_seat_role 回落到 seat 本身),
+        # 收紧成"必须是 A-D"会是配置层的破坏性变更,且重演 v1.7.1 A1 那种"新门误拒合法配置"。
+        # `not m.get("role")`: 显式写了 role 的席,seat 根本不参与角色解析(_seat_role 里 role
+        # 直接胜出),这种配置在 v1.7.1 上跑得好好的,新门不得拒它(预审 M1)。decide 模式尤其常见
+        # ——DEFAULT_SEAT_ROLE 按设计没有 decide 条目,角色全靠 member.role / custom_roles 注入。
+        if "seat" in m and not m.get("role") and (
+                m["seat"] is None
+                or (isinstance(m["seat"], str) and not m["seat"].strip())):
+            sys.exit(f"[config] members[{i}] ({m.get('name')}) seat 为空——seat 决定该席角色"
+                     f"(review: A=可行性质疑 / B=可维护性 / C=安全审计 / D=用户代言),"
+                     f"在开会讨论里还兼任匿名发言者身份与 blindvote 文件名。"
+                     f"写 A/B/C/D 之一,或整个删掉 seat 键(回落到默认角色)。")
         ck = m.get("cli_kind", "auto")
         if ck not in ("auto", "codex", "auggie"):
             sys.exit(f"[config] members[{i}] ({m.get('name')}) cli_kind={ck!r} 非法(应为 auto/codex/auggie)")
@@ -1626,8 +1820,7 @@ def cmd_generate(args, cfg):
     # channel=subagent 席位由仲裁人脚本外派发,不在 moa.py 内跑;此处只调度 api/cli 席位。
     dispatchable = [m for m in members if _has_dispatchable_channel(m)]
     skipped_sub = [m for m in members if m not in dispatchable]
-    collect = Path(args.collect_dir)
-    collect.mkdir(parents=True, exist_ok=True)
+    collect = _ensure_collect_dir(args.collect_dir)
 
     for m in skipped_sub:
         print(f"  - {m['name']} (seat {m.get('seat','?')}): channel=subagent, 交由仲裁人脚本外派发",
@@ -1694,6 +1887,15 @@ def cmd_stats(args, cfg):
     results = load_members(collect, round_no)
     if not results:
         sys.exit(f"no member_*.json in {collect} (round {round_no})")
+    actual = _detect_mode(results, round_no)
+    if actual is not None and actual != args.mode:
+        sys.exit(
+            f"[stats] --mode {args.mode} 与产物不符: {collect} 里全部成功席的字段形状都是 "
+            f"{actual} 产物。用 {args.mode} 聚合不会报错,只会给出全零的共识读数"
+            f"(verdict_tally / mean_confidence / 问题数皆空),而 synthesis.md 要求报告里的"
+            f"数量与共识度必须与 stats 一致——那份空读数就会被抄进最终报告。\n"
+            f"        改用: moa.py stats --mode {actual} --collect-dir {collect}"
+            + (f" --round {round_no}" if round_no else ""))
     if round_no == 0:
         stats = compute_stats(args.mode, results)
         out = collect / "stats.json"
@@ -1784,6 +1986,16 @@ def _require_unique_seats(cfg, phase):
     seen = {}
     for m in cfg.get("members", []) or []:
         seat = m.get("seat", "?")
+        # 非空要求同样只在 discuss 生效: validate_config 放行"空 seat + 显式 role"的席(role
+        # 直接胜出, 角色解析不需要 seat), 但 seat 在讨论里还兼任发言者身份与 blindvote 文件名——
+        # 写空会落到 blindvote_None.json, 再被 compute_discuss_stats 的 `if b.get("seat")` 当假值
+        # 丢掉, 于是该席的盲投漂移【静默】消失, 而漂移检测正是讨论模式的三重反从众对冲之一。
+        # 两席同为空 seat 会被下面的唯一性门抓到, 单独一席不会(预审 M3)。
+        if seat is None or (isinstance(seat, str) and not seat.strip()):
+            sys.exit(f"[{phase}] 开会讨论要求每席都有非空 seat——它是匿名发言者身份,也是 "
+                     f"blindvote_<seat>.json 的文件名;写空会落到 blindvote_None.json 并被收尾"
+                     f"盲投漂移对照静默丢弃。给 {m.get('name')!r} 写 A/B/C/D 之一。"
+                     f"(注:生成轮/精炼轮不需要 seat——那里显式 role 就够了,故 validate_config 放行。)")
         if seat in seen:
             sys.exit(f"[{phase}] 开会讨论要求 seat 唯一——它是委员的匿名发言者身份(转录署名 / 委员互引「委员X」/ "
                      f"盲投与 stats 都按 seat 聚合)。members {seen[seat]!r} 与 {m.get('name')!r} 同为 seat {seat!r};"
@@ -1809,8 +2021,7 @@ def cmd_discuss_turn(args, cfg):
     custom_roles = cfg.get("custom_roles", {}) or {}
     _require_unique_seats(cfg, "discuss-turn")
     m = _one_member(cfg, args.member, "discuss-turn")
-    collect = Path(args.collect_dir)
-    collect.mkdir(parents=True, exist_ok=True)
+    collect = _ensure_collect_dir(args.collect_dir)
     round_no = args.round
     if args.inject:
         parsed = _read_inject(args.inject)
@@ -1844,8 +2055,7 @@ def cmd_discuss_blindvote(args, cfg):
     custom_roles = cfg.get("custom_roles", {}) or {}
     _require_unique_seats(cfg, "discuss-blindvote")
     m = _one_member(cfg, args.member, "discuss-blindvote")
-    collect = Path(args.collect_dir)
-    collect.mkdir(parents=True, exist_ok=True)
+    collect = _ensure_collect_dir(args.collect_dir)
     if args.inject:
         parsed = _read_inject(args.inject)
         if parsed is None:
@@ -1878,7 +2088,8 @@ def cmd_discuss_stats(args, cfg):
     transcript = load_transcript(collect)
     if not transcript:
         sys.exit(f"no discussion.jsonl in {collect} (先跑 discuss-turn)")
-    blindvotes = [json.loads(p.read_text(encoding="utf-8"))
+    # 盲投产物同为手写可达路径(--inject 回填 CH1 席),坏文件同样给具名报错(见 _read_artifact)。
+    blindvotes = [_read_artifact(p, require_name=False)
                   for p in sorted(collect.glob("blindvote_*.json"))]
     stats = compute_discuss_stats(transcript, blindvotes)
     out = collect / "discuss_stats.json"
@@ -1914,6 +2125,27 @@ def cmd_leak_check(args):
     sys.exit(1)
 
 
+def _round_at_least(minimum, note=""):
+    """`--round` 的取值门(argparse type=)。轮次是仲裁人的编排计数器,不是自由整数:
+
+    - refine / discuss-*: 从 1 起。0 就是生成轮本身,"精炼到第 0 轮"不存在;旧行为是拿它去算
+      round-1,再报 `no round--1 products` 这种双横杠的怪话。
+    - discuss 尤其要拦: 0 或负数会被原样写进 discussion.jsonl,format_transcript 按轮次排序后
+      让后发言者读到「第 0 轮」「第 -1 轮」的发言记录——静默污染讨论上下文。
+    - stats: 允许 0(= 读生成轮产物),但不允许负数。"""
+    def _conv(s):
+        try:
+            v = int(s)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"需为整数,收到 {s!r}")
+        if v < minimum:
+            # note 按调用方给: "第 0 轮就是生成轮本身"对 refine 成立, 对 discuss 不成立
+            # ——开会讨论没有生成轮, 照抄会是一句假话(预审 L3)。
+            raise argparse.ArgumentTypeError(f"需 >= {minimum},收到 {v}{note}")
+        return v
+    return _conv
+
+
 def main():
     ap = argparse.ArgumentParser(description="MoA committee dispatcher (M3)")
     sub = ap.add_subparsers(dest="phase", required=True)
@@ -1934,12 +2166,13 @@ def main():
                        help='custom 委员会: 逗号分隔模型 ID(全 CH3),覆盖 config 的 members')
 
     g = sub.add_parser("generate"); common(g)
-    r = sub.add_parser("refine"); common(r); r.add_argument("--round", type=int, default=1)
+    r = sub.add_parser("refine"); common(r)
+    r.add_argument("--round", type=_round_at_least(1, "(第 0 轮就是生成轮本身)"), default=1)
     s = sub.add_parser("stats")
     s.add_argument("--config", default=None)
     s.add_argument("--mode", choices=["review", "decide", "brainstorm"], default="review")
     s.add_argument("--collect-dir", default="moa-reports/run")
-    s.add_argument("--round", type=int, default=0)
+    s.add_argument("--round", type=_round_at_least(0), default=0)
     d = sub.add_parser("dry-run")
     d.add_argument("--config", default=None)
     d.add_argument("--mode", choices=["review", "decide", "brainstorm"], default="review")
@@ -1952,10 +2185,10 @@ def main():
                     help="要扫描的路径;省略则扫描产物/文档/配置/skill 本体(不含 tests/)")
     # 开会讨论(§6 阶段5): 逐回合、可注入 CH1、盲投、统计
     dt = sub.add_parser("discuss-turn"); common(dt)
-    dt.add_argument("--round", type=int, default=1)
+    dt.add_argument("--round", type=_round_at_least(1, "(发言轮次从 1 起)"), default=1)
     dt.add_argument("--inject", default=None, help="CH1 子代理返回 JSON 的文件路径,回填该席回合")
     dpp = sub.add_parser("discuss-prompt"); common(dpp)
-    dpp.add_argument("--round", type=int, default=1)
+    dpp.add_argument("--round", type=_round_at_least(1, "(发言轮次从 1 起;盲投用 --blind,与轮次无关)"), default=1)
     dpp.add_argument("--blind", action="store_true", help="打印盲投 prompt 而非讨论回合 prompt")
     dbv = sub.add_parser("discuss-blindvote"); common(dbv)
     dbv.add_argument("--inject", default=None, help="CH1 子代理盲投 JSON 的文件路径")
